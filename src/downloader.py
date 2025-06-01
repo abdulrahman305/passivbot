@@ -33,11 +33,11 @@ from pure_funcs import (
     safe_filename,
     symbol_to_coin,
     get_template_live_config,
+    coin_to_symbol,
 )
 from procedures import (
     make_get_filepath,
     format_end_date,
-    coin_to_symbol,
     utc_ms,
     get_file_mod_utc,
     get_first_timestamps_unified,
@@ -121,8 +121,8 @@ def load_ohlcv_data(filepath: str) -> pd.DataFrame:
 
 def get_days_in_between(start_day, end_day):
     date_format = "%Y-%m-%d"
-    start_date = datetime.datetime.strptime(start_day[:10], date_format)
-    end_date = datetime.datetime.strptime(end_day[:10], date_format)
+    start_date = datetime.datetime.strptime(format_end_date(start_day), date_format)
+    end_date = datetime.datetime.strptime(format_end_date(end_day), date_format)
     days = []
     current_date = start_date
     while current_date <= end_date:
@@ -164,23 +164,36 @@ def attempt_gap_fix_ohlcvs(df, symbol=None):
     return new_df.reset_index().rename(columns={"index": "timestamp"})
 
 
-async def fetch_url(session, url):
-    async with session.get(url) as response:
-        response.raise_for_status()
-        return await response.read()
+async def fetch_url(session, url, retries=5, backoff=1.5):
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                return await response.read()
+        except Exception as e:
+            last_exc = e
+            wait_time = backoff**attempt
+            logging.warning(
+                f"Attempt {attempt + 1} failed for {url}: {e}, retrying in {wait_time:.1f}s..."
+            )
+            await asyncio.sleep(wait_time)
+    logging.error(f"All {retries} attempts failed for {url}")
+    raise last_exc
 
 
 async def fetch_zips(url):
-    try:
-        async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession() as session:
+        try:
             content = await fetch_url(session, url)
-        zips = []
-        with zipfile.ZipFile(BytesIO(content), "r") as z:
-            for f in z.namelist():
-                zips.append(z.open(f))
-        return zips
-    except Exception as e:
-        logging.error(f"Error fetching zips {url}: {e}")
+            zips = []
+            with zipfile.ZipFile(BytesIO(content), "r") as z:
+                for f in z.namelist():
+                    zips.append(z.open(f))
+            return zips
+        except Exception as e:
+            logging.error(f"Error fetching zips {url}: {e}")
+            return []
 
 
 async def get_zip_binance(url):
@@ -239,7 +252,7 @@ class OHLCVManager:
     ):
         self.exchange = "binanceusdm" if exchange == "binance" else exchange
         self.quote = "USDC" if exchange == "hyperliquid" else "USDT"
-        self.start_date = "2020-01-01" if start_date is None else start_date
+        self.start_date = "2020-01-01" if start_date is None else format_end_date(start_date)
         self.end_date = format_end_date("now" if end_date is None else end_date)
         self.start_ts = date_to_ts(self.start_date)
         self.end_ts = date_to_ts(self.end_date)
@@ -278,10 +291,8 @@ class OHLCVManager:
         assert self.markets, "needs to call self.load_markets() first"
         return coin_to_symbol(
             coin,
-            eligible_symbols={
-                k for k in self.markets if self.markets[k]["swap"] and k.endswith(f":{self.quote}")
-            },
-            verbose=self.verbose,
+            {k for k in self.markets if self.markets[k]["swap"] and k.endswith(f":{self.quote}")},
+            self.quote,
         )
 
     def get_market_specific_settings(self, coin):
@@ -911,14 +922,31 @@ async def prepare_hlcvs(config: dict, exchange: str):
         exchange = "binanceusdm"
     start_date = config["backtest"]["start_date"]
     end_date = format_end_date(config["backtest"]["end_date"])
+
+    # Initialize OHLCVManager for the exchange
     om = OHLCVManager(
         exchange,
         start_date,
         end_date,
         gap_tolerance_ohlcvs_minutes=config["backtest"]["gap_tolerance_ohlcvs_minutes"],
     )
+
     try:
-        return await prepare_hlcvs_internal(config, coins, exchange, start_date, end_date, om)
+        # Prepare HLCV data
+        mss, timestamps, hlcvs = await prepare_hlcvs_internal(
+            config, coins, exchange, start_date, end_date, om
+        )
+
+        om.update_date_range(timestamps[0], timestamps[-1])
+        btc_df = await om.get_ohlcvs("BTC")
+        if btc_df.empty:
+            raise ValueError(f"Failed to fetch BTC/USD prices from {exchange}")
+
+        # Ensure BTC/USD timestamps align with HLCV timestamps
+        btc_df = btc_df.set_index("timestamp").reindex(timestamps, method="ffill").reset_index()
+        btc_usd_prices = btc_df["close"].values  # Extract 1D array of closing prices
+
+        return mss, timestamps, hlcvs, btc_usd_prices
     finally:
         if om.cc:
             await om.cc.close()
@@ -960,11 +988,13 @@ async def prepare_hlcvs_internal(config, coins, exchange, start_date, end_date, 
                     f"{exchange} Coin {coin} too young, start date {ts_to_date_utc(first_ts)}. Skipping"
                 )
                 continue
-            first_ts_plus_min_coin_age = first_timestamps_unified[coin] + min_coin_age_ms
-            if first_ts_plus_min_coin_age >= end_ts:
+            coin_age_days = int(
+                round(utc_ms() - first_timestamps_unified[coin]) / (1000 * 60 * 60 * 24)
+            )
+            if coin_age_days < minimum_coin_age_days:
                 logging.info(
-                    f"{exchange} Coin {coin}: Not traded due to min_coin_age {int(minimum_coin_age_days)} days"
-                    f"{ts_to_date_utc(first_ts_plus_min_coin_age)}. Skipping"
+                    f"{exchange} Coin {coin}: Not traded due to min_coin_age {int(minimum_coin_age_days)} days. "
+                    f"{coin} is {coin_age_days} days old. Skipping"
                 )
                 continue
             new_adjusted_start_ts = max(first_timestamps_unified[coin] + min_coin_age_ms, first_ts)
@@ -1013,10 +1043,12 @@ async def prepare_hlcvs_internal(config, coins, exchange, start_date, end_date, 
     timestamps = np.arange(global_start_time, global_end_time + interval_ms, interval_ms)
 
     # Pre-allocate the unified array
-    unified_array = np.zeros((n_timesteps, n_coins, 4))
+    unified_array = np.full((n_timesteps, n_coins, 4), -1.0, dtype=np.float64)
 
     # Second pass: Load data from disk and populate the unified array
-    logging.info(f"{exchange} Unifying data for {len(valid_coins)} coins into single numpy array...")
+    logging.info(
+        f"{exchange} Unifying data for {len(valid_coins)} coin{'s' if len(valid_coins) > 1 else ''} into single numpy array..."
+    )
     for i, coin in enumerate(tqdm(valid_coins, desc="Processing coins", unit="coin")):
         file_path = valid_coins[coin]
         ohlcv = np.load(file_path)
@@ -1052,33 +1084,45 @@ async def prepare_hlcvs_internal(config, coins, exchange, start_date, end_date, 
 
 
 async def prepare_hlcvs_combined(config):
-    """
-    Public function that sets up any needed resources,
-    calls the internal implementation, and ensures
-    ccxt connections are closed in a finally block.
-    """
-    # Create or load the OHLCVManager dict
     exchanges_to_consider = [
         "binanceusdm" if e == "binance" else e for e in config["backtest"]["exchanges"]
     ]
     om_dict = {}
     for ex in exchanges_to_consider:
-        om = OHLCVManager(
+        om_dict[ex] = OHLCVManager(
             ex,
             config["backtest"]["start_date"],
             config["backtest"]["end_date"],
             gap_tolerance_ohlcvs_minutes=config["backtest"]["gap_tolerance_ohlcvs_minutes"],
         )
-        # await om.load_markets()  # if you want to do this up front
-        om_dict[ex] = om
+    btc_om = None
 
     try:
-        return await _prepare_hlcvs_combined_impl(config, om_dict)
+        mss, timestamps, unified_array = await _prepare_hlcvs_combined_impl(config, om_dict)
+
+        # Always fetch BTC/USD prices
+        btc_exchange = exchanges_to_consider[0] if len(exchanges_to_consider) == 1 else "binanceusdm"
+        btc_om = OHLCVManager(
+            btc_exchange,
+            config["backtest"]["start_date"],
+            config["backtest"]["end_date"],
+            gap_tolerance_ohlcvs_minutes=config["backtest"]["gap_tolerance_ohlcvs_minutes"],
+        )
+        btc_df = await btc_om.get_ohlcvs("BTC")
+        if btc_df.empty:
+            raise ValueError(f"Failed to fetch BTC/USD prices from {btc_exchange}")
+
+        # Align BTC/USD timestamps with unified timestamps
+        btc_df = btc_df.set_index("timestamp").reindex(timestamps, method="ffill").reset_index()
+        btc_usd_prices = btc_df["close"].values
+
+        return mss, timestamps, unified_array, btc_usd_prices
     finally:
-        # Cleanly close all ccxt sessions
         for om in om_dict.values():
             if om.cc:
                 await om.cc.close()
+        if btc_om and btc_om.cc:
+            await btc_om.cc.close()
 
 
 async def _prepare_hlcvs_combined_impl(config, om_dict):
@@ -1141,10 +1185,11 @@ async def _prepare_hlcvs_combined_impl(config, om_dict):
             continue
 
         # Check if coin is "too young": first_ts + min_coin_age >= end_ts
-        # meaning there's effectively no eligible window to trade/backtest
-        if coin_fts + min_coin_age_ms >= end_ts:
+        coin_age_days = int(round(utc_ms() - coin_fts) / (1000 * 60 * 60 * 24))
+        if coin_age_days < min_coin_age_days:
             logging.info(
-                f"Skipping coin {coin}: it does not satisfy the minimum_coin_age_days = {min_coin_age_days}"
+                f"Skipping coin {coin}: it does not satisfy the minimum_coin_age_days = {min_coin_age_days}. "
+                f"{coin} is {coin_age_days} days old."
             )
             continue
 
@@ -1239,7 +1284,7 @@ async def _prepare_hlcvs_combined_impl(config, om_dict):
     pprint.pprint(dict(exchange_volume_ratios_mapped))
 
     # We'll store [high, low, close, volume] in the last dimension
-    unified_array = np.zeros((n_timesteps, n_coins, 4), dtype=np.float64)
+    unified_array = np.full((n_timesteps, n_coins, 4), -1.0, dtype=np.float64)
 
     # For each coin i, reindex its DataFrame onto the full timestamps
     for i, coin in enumerate(valid_coins):
@@ -1256,11 +1301,11 @@ async def _prepare_hlcvs_combined_impl(config, om_dict):
         df["high"] = df["high"].fillna(df["close"])
         df["low"] = df["low"].fillna(df["close"])
 
-        # Fill volume with 0.0 for missing bars, then apply scaling factor
-        df["volume"] = df["volume"].fillna(0.0)
+        # Apply scaling factor, then fill volume with -1.0 for missing bars
         exchange_for_this_coin = chosen_mss_per_coin[coin]["exchange"]
         scaling_factor = exchange_volume_ratios_mapped[exchange_for_this_coin][reference_exchange]
         df["volume"] *= scaling_factor
+        df["volume"] = df["volume"].fillna(-1.0)
 
         # Now extract columns in correct order
         coin_data = df[["high", "low", "close", "volume"]].values

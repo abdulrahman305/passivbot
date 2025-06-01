@@ -63,6 +63,25 @@ pub fn round_dynamic_dn(n: f64, d: i32) -> f64 {
 }
 
 #[pyfunction]
+pub fn hysteresis_rounding(
+    balance: f64,
+    last_rounded_balance: f64,
+    percentage: f64,
+    h: f64,
+) -> f64 {
+    let step = last_rounded_balance * percentage;
+    let threshold = step * h;
+    let rounded_balance = if balance > last_rounded_balance + threshold {
+        last_rounded_balance + step
+    } else if balance < last_rounded_balance - threshold {
+        last_rounded_balance - step
+    } else {
+        last_rounded_balance
+    };
+    round_dynamic(rounded_balance, 6)
+}
+
+#[pyfunction]
 pub fn calc_diff(x: f64, y: f64) -> f64 {
     if y == 0.0 {
         if x == 0.0 {
@@ -178,6 +197,7 @@ pub fn calc_pnl_short(entry_price: f64, close_price: f64, qty: f64, c_mult: f64)
     qty.abs() * c_mult * (entry_price - close_price)
 }
 
+#[pyfunction]
 pub fn calc_pprice_diff_int(pside: usize, pprice: f64, price: f64) -> f64 {
     match pside {
         LONG => {

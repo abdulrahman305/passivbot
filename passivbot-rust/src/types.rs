@@ -1,3 +1,4 @@
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -22,7 +23,7 @@ impl Default for ExchangeParams {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BacktestParams {
     pub starting_balance: f64,
     pub maker_fee: f64,
@@ -95,8 +96,8 @@ pub struct BotParamsPair {
 
 #[derive(Clone, Default, Debug)]
 pub struct BotParams {
-    pub close_grid_markup_range: f64,
-    pub close_grid_min_markup: f64,
+    pub close_grid_markup_end: f64,
+    pub close_grid_markup_start: f64,
     pub close_grid_qty_pct: f64,
     pub close_trailing_retracement_pct: f64,
     pub close_trailing_grid_ratio: f64,
@@ -108,11 +109,13 @@ pub struct BotParams {
     pub entry_grid_spacing_pct: f64,
     pub entry_initial_ema_dist: f64,
     pub entry_initial_qty_pct: f64,
+    pub entry_trailing_double_down_factor: f64,
     pub entry_trailing_retracement_pct: f64,
     pub entry_trailing_grid_ratio: f64,
     pub entry_trailing_threshold_pct: f64,
-    pub filter_rolling_window: usize,
-    pub filter_relative_volume_clip_pct: f64,
+    pub filter_noisiness_rolling_window: usize,
+    pub filter_volume_rolling_window: usize,
+    pub filter_volume_drop_pct: f64,
     pub ema_span_0: f64,
     pub ema_span_1: f64,
     pub n_positions: usize,
@@ -203,13 +206,32 @@ impl fmt::Display for OrderType {
     }
 }
 
+#[derive(Default)]
+pub struct Balance {
+    pub usd: f64,                 // usd balance
+    pub usd_total: f64,           // total in usd
+    pub usd_total_rounded: f64,   // total in usd rounded for calculations
+    pub btc: f64,                 // btc balance
+    pub btc_total: f64,           // total in btc
+    pub use_btc_collateral: bool, // whether to use btc as collateral
+}
+
+#[derive(Default, Clone)]
+pub struct Equities {
+    pub usd: Vec<f64>,
+    pub btc: Vec<f64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Fill {
     pub index: usize,
     pub coin: String,
     pub pnl: f64,
     pub fee_paid: f64,
-    pub balance: f64,
+    pub balance_usd_total: f64,
+    pub balance_btc: f64, // Added: BTC balance after fill
+    pub balance_usd: f64, // Added: USD balance after fill
+    pub btc_price: f64,   // Added: BTC/USD price at time of fill
     pub fill_qty: f64,
     pub fill_price: f64,
     pub position_size: f64,
@@ -217,7 +239,7 @@ pub struct Fill {
     pub order_type: OrderType,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Analysis {
     pub adg: f64,
     pub mdg: f64,
@@ -236,10 +258,18 @@ pub struct Analysis {
     pub equity_balance_diff_pos_mean: f64,
     pub loss_profit_ratio: f64,
 
+    pub equity_choppiness: f64,
+    pub equity_jerkiness: f64,
+    pub exponential_fit_error: f64,
+    pub equity_choppiness_w: f64,
+    pub equity_jerkiness_w: f64,
+    pub exponential_fit_error_w: f64,
+
     pub positions_held_per_day: f64,
     pub position_held_hours_mean: f64,
     pub position_held_hours_max: f64,
     pub position_held_hours_median: f64,
+    pub position_unchanged_hours_max: f64,
 
     pub adg_w: f64,
     pub mdg_w: f64,
@@ -249,6 +279,8 @@ pub struct Analysis {
     pub calmar_ratio_w: f64,
     pub sterling_ratio_w: f64,
     pub loss_profit_ratio_w: f64,
+    pub volume_pct_per_day_avg: f64,
+    pub volume_pct_per_day_avg_w: f64,
 }
 
 impl Default for Analysis {
@@ -270,11 +302,14 @@ impl Default for Analysis {
             equity_balance_diff_pos_max: 1.0,
             equity_balance_diff_pos_mean: 1.0,
             loss_profit_ratio: 1.0,
+            equity_choppiness: 1.0,
+            equity_jerkiness: 1.0,
+            exponential_fit_error: 1.0,
             positions_held_per_day: 0.0,
             position_held_hours_mean: 0.0,
             position_held_hours_max: 0.0,
             position_held_hours_median: 0.0,
-
+            position_unchanged_hours_max: 0.0,
             adg_w: 0.0,
             mdg_w: 0.0,
             sharpe_ratio_w: 0.0,
@@ -283,6 +318,11 @@ impl Default for Analysis {
             calmar_ratio_w: 0.0,
             sterling_ratio_w: 0.0,
             loss_profit_ratio_w: 1.0,
+            equity_choppiness_w: 1.0,
+            equity_jerkiness_w: 1.0,
+            exponential_fit_error_w: 1.0,
+            volume_pct_per_day_avg: 0.0,
+            volume_pct_per_day_avg_w: 0.0,
         }
     }
 }

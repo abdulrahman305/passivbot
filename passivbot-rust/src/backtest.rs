@@ -7,15 +7,16 @@ use crate::entries::{
     calc_next_entry_short,
 };
 use crate::types::{
-    Analysis, BacktestParams, BotParams, BotParamsPair, EMABands, ExchangeParams, Fill, Order,
-    OrderBook, OrderType, Position, Positions, StateParams, TrailingPriceBundle,
+    Analysis, BacktestParams, Balance, BotParams, BotParamsPair, EMABands, Equities,
+    ExchangeParams, Fill, Order, OrderBook, OrderType, Position, Positions, StateParams,
+    TrailingPriceBundle,
 };
 use crate::utils::{
     calc_auto_unstuck_allowance, calc_new_psize_pprice, calc_pnl_long, calc_pnl_short,
-    calc_pprice_diff_int, calc_wallet_exposure, cost_to_qty, qty_to_cost, round_, round_dn,
-    round_up,
+    calc_pprice_diff_int, calc_wallet_exposure, cost_to_qty, hysteresis_rounding, qty_to_cost,
+    round_, round_dn, round_up,
 };
-use ndarray::{s, Array1, Array2, Array3, Array4, ArrayView3, Axis, Dim, ViewRepr};
+use ndarray::{s, Array1, Array2, Array3, Array4, ArrayView1, ArrayView3, Axis, Dim, ViewRepr};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -118,10 +119,11 @@ pub struct RollingVolumeSum {
 
 pub struct Backtest<'a> {
     hlcvs: &'a ArrayView3<'a, f64>,
+    btc_usd_prices: &'a ArrayView1<'a, f64>, // Change to ArrayView1 (1D view)
     bot_params_pair: BotParamsPair,
     exchange_params_list: Vec<ExchangeParams>,
     backtest_params: BacktestParams,
-    balance: f64,
+    pub balance: Balance,
     n_coins: usize,
     ema_alphas: EmaAlphas,
     emas: Vec<EMAs>,
@@ -135,8 +137,9 @@ pub struct Backtest<'a> {
     is_stuck: IsStuck,
     trading_enabled: TradingEnabled,
     trailing_enabled: TrailingEnabled,
-    equities: Vec<f64>,
-    delist_timestamps: HashMap<usize, usize>,
+    equities: Equities,
+    last_valid_timestamps: HashMap<usize, usize>,
+    first_valid_timestamps: HashMap<usize, usize>,
     did_fill_long: HashSet<usize>,
     did_fill_short: HashSet<usize>,
     n_eligible_long: usize,
@@ -148,10 +151,29 @@ pub struct Backtest<'a> {
 impl<'a> Backtest<'a> {
     pub fn new(
         hlcvs: &'a ArrayView3<'a, f64>,
+        btc_usd_prices: &'a ArrayView1<'a, f64>, // Updated parameter type
         bot_params_pair: BotParamsPair,
         exchange_params_list: Vec<ExchangeParams>,
         backtest_params: &BacktestParams,
     ) -> Self {
+        // Determine if BTC collateral is used
+        let mut balance = Balance::default();
+        balance.use_btc_collateral = btc_usd_prices.iter().any(|&p| p != 1.0);
+
+        // Initialize balances
+        balance.btc = if balance.use_btc_collateral {
+            backtest_params.starting_balance / btc_usd_prices[0]
+        } else {
+            0.0
+        };
+        balance.usd = if balance.use_btc_collateral {
+            0.0
+        } else {
+            backtest_params.starting_balance
+        };
+        balance.usd_total = backtest_params.starting_balance;
+        balance.usd_total_rounded = balance.usd_total;
+
         let n_timesteps = hlcvs.shape()[0];
         let n_coins = hlcvs.shape()[1];
         let initial_emas = (0..n_coins)
@@ -163,25 +185,26 @@ impl<'a> Backtest<'a> {
                 }
             })
             .collect();
-        let mut equities = Vec::<f64>::new();
-        equities.push(backtest_params.starting_balance);
+        let mut equities = Equities::default();
+        equities.usd.push(backtest_params.starting_balance);
+        equities.btc.push(balance.btc); // Initial BTC equity
         let mut bot_params_pair_cloned = bot_params_pair.clone();
         bot_params_pair_cloned.long.n_positions = n_coins.min(bot_params_pair.long.n_positions);
         bot_params_pair_cloned.short.n_positions = n_coins.min(bot_params_pair.short.n_positions);
         let n_eligible_long = bot_params_pair_cloned.long.n_positions.max(
-            (n_coins as f64 * (1.0 - bot_params_pair.long.filter_relative_volume_clip_pct)).round()
-                as usize,
+            (n_coins as f64 * (1.0 - bot_params_pair.long.filter_volume_drop_pct)).round() as usize,
         );
         let n_eligible_short = bot_params_pair_cloned.short.n_positions.max(
-            (n_coins as f64 * (1.0 - bot_params_pair.short.filter_relative_volume_clip_pct)).round()
+            (n_coins as f64 * (1.0 - bot_params_pair.short.filter_volume_drop_pct)).round()
                 as usize,
         );
         Backtest {
             hlcvs,
+            btc_usd_prices,
             bot_params_pair: bot_params_pair_cloned,
             exchange_params_list,
             backtest_params: backtest_params.clone(),
-            balance: backtest_params.starting_balance,
+            balance,
             n_coins,
             ema_alphas: calc_ema_alphas(&bot_params_pair),
             emas: initial_emas,
@@ -206,7 +229,8 @@ impl<'a> Backtest<'a> {
                     || bot_params_pair.short.entry_trailing_grid_ratio != 0.0,
             },
             equities: equities,
-            delist_timestamps: HashMap::new(),
+            last_valid_timestamps: HashMap::new(),
+            first_valid_timestamps: HashMap::new(),
             did_fill_long: HashSet::new(),
             did_fill_short: HashSet::new(),
             n_eligible_long,
@@ -234,18 +258,20 @@ impl<'a> Backtest<'a> {
             _ => panic!("Invalid pside"),
         };
 
-        // Early return if all coins are already eligible
         if self.n_coins <= n_positions {
             return (0..self.n_coins).collect();
         }
+        let volume_filtered = self.filter_by_relative_volume(k, pside);
+        self.rank_by_noisiness(k, &volume_filtered, pside)
+    }
 
-        let n_eligible = match pside {
-            LONG => self.n_eligible_long,
-            SHORT => self.n_eligible_short,
+    fn filter_by_relative_volume(&mut self, k: usize, pside: usize) -> Vec<usize> {
+        let bot_params = match pside {
+            LONG => &self.bot_params_pair.long,
+            SHORT => &self.bot_params_pair.short,
             _ => panic!("Invalid pside"),
         };
-
-        let window = bot_params.filter_rolling_window;
+        let window = bot_params.filter_volume_rolling_window;
         let start_k = k.saturating_sub(window);
 
         let (rolling_volume_sum, prev_k) = match pside {
@@ -260,12 +286,9 @@ impl<'a> Backtest<'a> {
             _ => panic!("Invalid pside"),
         };
 
-        // Use the pre-allocated buffer for volume indices
         let volume_indices = self.volume_indices_buffer.as_mut().unwrap();
 
-        // Update rolling volume sums
         if k > window && k - *prev_k < window {
-            // Rolling calculation
             let safe_start = (*prev_k).saturating_sub(window);
             for idx in 0..self.n_coins {
                 rolling_volume_sum[idx] -=
@@ -274,7 +297,6 @@ impl<'a> Backtest<'a> {
                 volume_indices[idx] = (rolling_volume_sum[idx], idx);
             }
         } else {
-            // Full calculation
             for idx in 0..self.n_coins {
                 rolling_volume_sum[idx] = self.hlcvs.slice(s![start_k..k, idx, VOLUME]).sum();
                 volume_indices[idx] = (rolling_volume_sum[idx], idx);
@@ -282,33 +304,47 @@ impl<'a> Backtest<'a> {
         }
         *prev_k = k;
 
-        // Sort by volume in descending order
         volume_indices.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
 
-        // Calculate noisiness for top n_eligible coins
-        let actual_n_eligible = n_eligible.min(self.n_coins);
-        let mut noisinesses = Vec::with_capacity(actual_n_eligible);
+        let n_eligible = match pside {
+            LONG => self.n_eligible_long,
+            SHORT => self.n_eligible_short,
+            _ => panic!("Invalid pside"),
+        };
+        volume_indices
+            .iter()
+            .take(n_eligible.min(self.n_coins))
+            .map(|&(_, idx)| idx)
+            .collect()
+    }
 
-        for &(_, idx) in volume_indices.iter().take(actual_n_eligible) {
-            let noisiness: f64 = self
-                .hlcvs
-                .slice(s![start_k..k, idx, ..])
-                .axis_iter(Axis(0))
-                .map(|row| (row[HIGH] - row[LOW]) / row[CLOSE])
-                .sum();
-            noisinesses.push((noisiness, idx));
-        }
+    fn rank_by_noisiness(&self, k: usize, candidates: &[usize], pside: usize) -> Vec<usize> {
+        let bot_params = match pside {
+            LONG => &self.bot_params_pair.long,
+            SHORT => &self.bot_params_pair.short,
+            _ => panic!("Invalid pside"),
+        };
+        let start_k = k.saturating_sub(bot_params.filter_noisiness_rolling_window);
 
-        // Sort by noisiness in descending order
+        let mut noisinesses: Vec<(f64, usize)> = candidates
+            .iter()
+            .map(|&idx| {
+                let noisiness: f64 = self
+                    .hlcvs
+                    .slice(s![start_k..k, idx, ..])
+                    .axis_iter(Axis(0))
+                    .map(|row| (row[HIGH] - row[LOW]) / row[CLOSE])
+                    .sum();
+                (noisiness, idx)
+            })
+            .collect();
+
         noisinesses.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
-
-        // Return indices sorted by noisiness
         noisinesses.into_iter().map(|(_, idx)| idx).collect()
     }
-    pub fn run(&mut self) -> (Vec<Fill>, Vec<f64>) {
-        let check_points: Vec<usize> = (0..7).map(|i| i * 60 * 24).collect();
-        let n_timesteps = self.hlcvs.shape()[0];
 
+    pub fn run(&mut self) -> (Vec<Fill>, Equities) {
+        let n_timesteps = self.hlcvs.shape()[0];
         for idx in 0..self.n_coins {
             self.trailing_prices
                 .long
@@ -316,34 +352,43 @@ impl<'a> Backtest<'a> {
             self.trailing_prices
                 .short
                 .insert(idx, TrailingPriceBundle::default());
+        }
 
-            // check if the coin was delisted at any point
-            if n_timesteps > *check_points.last().unwrap() {
-                let last_hlc_close = self.hlcvs[[n_timesteps - 1, idx, CLOSE]];
-                if check_points.iter().all(|&point| {
-                    self.hlcvs[[n_timesteps - 1 - point, idx, HIGH]] == last_hlc_close
-                        && self.hlcvs[[n_timesteps - 1 - point, idx, LOW]] == last_hlc_close
-                        && self.hlcvs[[n_timesteps - 1 - point, idx, CLOSE]] == last_hlc_close
-                }) {
-                    // was delisted. Find timestamp of delisting
-                    let mut i = n_timesteps - check_points.last().unwrap();
-                    while i > 0
-                        && self.hlcvs[[i, idx, HIGH]] == last_hlc_close
-                        && self.hlcvs[[i, idx, LOW]] == last_hlc_close
-                        && self.hlcvs[[i, idx, CLOSE]] == last_hlc_close
-                    {
-                        i -= 1;
-                    }
-                    if i > 1 {
-                        self.delist_timestamps.insert(idx, i);
-                    }
-                }
+        // --- find first & last valid candle for every coin (binary-search) ---
+        let (first_valid, last_valid) = find_valid_timestamp_bounds(&self.hlcvs);
+        for idx in 0..self.n_coins {
+            self.first_valid_timestamps.insert(idx, first_valid[idx]);
+            if n_timesteps - last_valid[idx] > 1400 {
+                // add only if delisted more than one day before last timestamp
+                self.last_valid_timestamps.insert(idx, last_valid[idx]); // keep same name for callers
             }
         }
+
         for k in 1..(n_timesteps - 1) {
             self.check_for_fills(k);
             self.update_emas(k);
-            self.update_open_orders(k);
+            let mut balance_changed = false;
+            if self.balance.use_btc_collateral {
+                self.balance.usd_total =
+                    (self.balance.btc * self.btc_usd_prices[k]) + self.balance.usd;
+                self.balance.btc_total = self.balance.usd_total / self.btc_usd_prices[k];
+                let new_usd_total_rounded = hysteresis_rounding(
+                    self.balance.usd_total,
+                    self.balance.usd_total_rounded,
+                    0.02,
+                    0.5,
+                );
+                if new_usd_total_rounded != self.balance.usd_total_rounded {
+                    balance_changed = true;
+                }
+                self.balance.usd_total_rounded = new_usd_total_rounded;
+            }
+            if balance_changed || !self.did_fill_long.is_empty() || !self.did_fill_short.is_empty()
+            {
+                self.update_open_orders_any_fill(k);
+            } else {
+                self.update_open_orders_no_fill(k);
+            }
             self.update_equities(k);
         }
         (self.fills.clone(), self.equities.clone())
@@ -352,7 +397,7 @@ impl<'a> Backtest<'a> {
     fn create_state_params(&self, k: usize, idx: usize, pside: usize) -> StateParams {
         let close_price = self.hlcvs[[k, idx, CLOSE]];
         StateParams {
-            balance: self.balance,
+            balance: self.balance.usd_total_rounded,
             order_book: OrderBook {
                 bid: close_price,
                 ask: close_price,
@@ -369,13 +414,50 @@ impl<'a> Backtest<'a> {
         }
     }
 
-    fn update_equities(&mut self, k: usize) {
-        let mut equity = self.balance;
+    fn update_balance(&mut self, k: usize, mut pnl: f64, fee_paid: f64) {
+        if self.balance.use_btc_collateral {
+            // Fees reduce USD portion
+            self.balance.usd += fee_paid;
 
-        // Sort long keys
+            if pnl > 0.0 {
+                // If USD balance is negative, offset it with realized PNL first
+                if self.balance.usd < 0.0 {
+                    let offset_amount = pnl.min(-self.balance.usd);
+                    self.balance.usd += offset_amount;
+                    pnl -= offset_amount;
+                }
+                // Any remaining positive PNL is converted to BTC
+                if pnl > 0.0 {
+                    let btc_to_add = (pnl / self.btc_usd_prices[k]);
+                    self.balance.btc += btc_to_add * 0.999; // apply 0.1% spot trading fee
+                }
+            } else if pnl < 0.0 {
+                // Negative PNL directly reduces USD
+                self.balance.usd += pnl;
+            }
+
+            // Now recalc totals
+            self.balance.usd_total = (self.balance.btc * self.btc_usd_prices[k]) + self.balance.usd;
+            self.balance.btc_total = self.balance.usd_total / self.btc_usd_prices[k];
+        } else {
+            // Simple USD-only logic
+            self.balance.usd += pnl + fee_paid;
+
+            // Keep total fields consistent
+            self.balance.usd_total = self.balance.usd;
+            self.balance.usd_total_rounded = self.balance.usd;
+            self.balance.btc_total = 0.0;
+        }
+    }
+
+    fn update_equities(&mut self, k: usize) {
+        // Start with the “running totals” in our Balance struct
+        let mut equity_usd = self.balance.usd_total;
+        let mut equity_btc = self.balance.btc_total;
+
+        // Add the unrealized PNL of all positions
         let mut long_keys: Vec<usize> = self.positions.long.keys().cloned().collect();
         long_keys.sort();
-        // Calculate unrealized PnL for each long position in sorted order
         for idx in long_keys {
             let position = &self.positions.long[&idx];
             let current_price = self.hlcvs[[k, idx, CLOSE]];
@@ -385,13 +467,12 @@ impl<'a> Backtest<'a> {
                 position.size,
                 self.exchange_params_list[idx].c_mult,
             );
-            equity += upnl;
+            equity_usd += upnl;
+            equity_btc += upnl / self.btc_usd_prices[k];
         }
 
-        // Sort short keys
         let mut short_keys: Vec<usize> = self.positions.short.keys().cloned().collect();
         short_keys.sort();
-        // Calculate unrealized PnL for each short position in sorted order
         for idx in short_keys {
             let position = &self.positions.short[&idx];
             let current_price = self.hlcvs[[k, idx, CLOSE]];
@@ -401,10 +482,13 @@ impl<'a> Backtest<'a> {
                 position.size,
                 self.exchange_params_list[idx].c_mult,
             );
-            equity += upnl;
+            equity_usd += upnl;
+            equity_btc += upnl / self.btc_usd_prices[k];
         }
 
-        self.equities.push(equity);
+        // Finally push the results into the Equities struct
+        self.equities.usd.push(equity_usd);
+        self.equities.btc.push(equity_btc);
     }
 
     fn update_actives(&mut self, k: usize, pside: usize) -> Vec<usize> {
@@ -553,7 +637,7 @@ impl<'a> Backtest<'a> {
                 if self.positions.long.contains_key(&idx) {
                     let wallet_exposure = calc_wallet_exposure(
                         self.exchange_params_list[idx].c_mult,
-                        self.balance,
+                        self.balance.usd_total_rounded,
                         self.positions.long[&idx].size,
                         self.positions.long[&idx].price,
                     );
@@ -572,7 +656,7 @@ impl<'a> Backtest<'a> {
                 if self.positions.short.contains_key(&idx) {
                     let wallet_exposure = calc_wallet_exposure(
                         self.exchange_params_list[idx].c_mult,
-                        self.balance,
+                        self.balance.usd_total_rounded,
                         self.positions.short[&idx].size.abs(),
                         self.positions.short[&idx].price,
                     );
@@ -602,6 +686,7 @@ impl<'a> Backtest<'a> {
             println!("coin: {}", self.backtest_params.coins[idx]);
             println!("new_psize: {}", new_psize);
             println!("close order: {:?}", close_fill);
+            println!("bot config: {:?}", self.bot_params_pair.long);
             new_psize = 0.0;
             adjusted_close_qty = -self.positions.long[&idx].size;
         }
@@ -618,7 +703,7 @@ impl<'a> Backtest<'a> {
         );
         self.pnl_cumsum_running += pnl;
         self.pnl_cumsum_max = self.pnl_cumsum_max.max(self.pnl_cumsum_running);
-        self.balance += pnl + fee_paid;
+        self.update_balance(k, pnl, fee_paid);
 
         let current_pprice = self.positions.long[&idx].price;
         if new_psize == 0.0 {
@@ -631,7 +716,10 @@ impl<'a> Backtest<'a> {
             coin: self.backtest_params.coins[idx].clone(), // coin
             pnl,                                           // realized pnl
             fee_paid,                                      // fee paid
-            balance: self.balance,                         // balance after fill
+            balance_usd_total: self.balance.usd_total,     // balance after fill
+            balance_btc: self.balance.btc,                 // Added
+            balance_usd: self.balance.usd,                 // Added
+            btc_price: self.btc_usd_prices[k],             // Added
             fill_qty: adjusted_close_qty,                  // fill qty
             fill_price: close_fill.price,                  // fill price
             position_size: new_psize,                      // psize after fill
@@ -667,7 +755,7 @@ impl<'a> Backtest<'a> {
         );
         self.pnl_cumsum_running += pnl;
         self.pnl_cumsum_max = self.pnl_cumsum_max.max(self.pnl_cumsum_running);
-        self.balance += pnl + fee_paid;
+        self.update_balance(k, pnl, fee_paid);
 
         let current_pprice = self.positions.short[&idx].price;
         if new_psize == 0.0 {
@@ -680,7 +768,10 @@ impl<'a> Backtest<'a> {
             coin: self.backtest_params.coins[idx].clone(), // coin
             pnl,                                           // realized pnl
             fee_paid,                                      // fee paid
-            balance: self.balance,                         // balance after fill
+            balance_usd_total: self.balance.usd_total,     // balance after fill
+            balance_btc: self.balance.btc,                 // Added
+            balance_usd: self.balance.usd,                 // Added
+            btc_price: self.btc_usd_prices[k],             // Added
             fill_qty: adjusted_close_qty,                  // fill qty
             fill_price: order.price,                       // fill price
             position_size: new_psize,                      // psize after fill
@@ -696,7 +787,8 @@ impl<'a> Backtest<'a> {
             order.price,
             self.exchange_params_list[idx].c_mult,
         ) * self.backtest_params.maker_fee;
-        self.balance += fee_paid;
+        self.update_balance(k, 0.0, fee_paid);
+
         let position_entry = self
             .positions
             .long
@@ -716,7 +808,10 @@ impl<'a> Backtest<'a> {
             coin: self.backtest_params.coins[idx].clone(),   // coin
             pnl: 0.0,                                        // realized pnl
             fee_paid,                                        // fee paid
-            balance: self.balance,                           // balance after fill
+            balance_usd_total: self.balance.usd_total,       // balance after fill
+            balance_btc: self.balance.btc,                   // Added
+            balance_usd: self.balance.usd,                   // Added
+            btc_price: self.btc_usd_prices[k],               // Added
             fill_qty: order.qty,                             // fill qty
             fill_price: order.price,                         // fill price
             position_size: self.positions.long[&idx].size,   // psize after fill
@@ -732,7 +827,7 @@ impl<'a> Backtest<'a> {
             order.price,
             self.exchange_params_list[idx].c_mult,
         ) * self.backtest_params.maker_fee;
-        self.balance += fee_paid;
+        self.update_balance(k, 0.0, fee_paid);
         let position_entry = self
             .positions
             .short
@@ -752,7 +847,10 @@ impl<'a> Backtest<'a> {
             coin: self.backtest_params.coins[idx].clone(),    // coin
             pnl: 0.0,                                         // realized pnl
             fee_paid,                                         // fee paid
-            balance: self.balance,                            // balance after fill
+            balance_usd_total: self.balance.usd_total,        // balance after fill
+            balance_btc: self.balance.btc,                    // Added
+            balance_usd: self.balance.usd,                    // Added
+            btc_price: self.btc_usd_prices[k],                // Added
             fill_qty: order.qty,                              // fill qty
             fill_price: order.price,                          // fill price
             position_size: self.positions.short[&idx].size,   // psize after fill
@@ -884,9 +982,9 @@ impl<'a> Backtest<'a> {
             .unwrap_or(Position::default());
 
         // check if coin is delisted; if so, close pos as unstuck close
-        if let Some(&delist_timestamp) = self.delist_timestamps.get(&idx) {
+        if let Some(&delist_timestamp) = self.last_valid_timestamps.get(&idx) {
             if k >= delist_timestamp && self.positions.long.contains_key(&idx) {
-                self.open_orders.long.get_mut(&idx).unwrap().closes = [Order {
+                self.open_orders.long.entry(idx).or_default().closes = vec![Order {
                     qty: -self.positions.long[&idx].size,
                     price: round_(
                         f64::min(
@@ -896,9 +994,13 @@ impl<'a> Backtest<'a> {
                         self.exchange_params_list[idx].price_step,
                     ),
                     order_type: OrderType::CloseUnstuckLong,
-                }]
-                .to_vec();
-                self.open_orders.long.entry(idx).or_default().entries = Vec::new();
+                }];
+                self.open_orders
+                    .long
+                    .entry(idx)
+                    .or_default()
+                    .entries
+                    .clear();
                 return;
             }
         }
@@ -956,9 +1058,9 @@ impl<'a> Backtest<'a> {
             .unwrap_or(Position::default());
 
         // check if coin is delisted; if so, close pos as unstuck close
-        if let Some(&delist_timestamp) = self.delist_timestamps.get(&idx) {
+        if let Some(&delist_timestamp) = self.last_valid_timestamps.get(&idx) {
             if k >= delist_timestamp && self.positions.short.contains_key(&idx) {
-                self.open_orders.short.get_mut(&idx).unwrap().closes = [Order {
+                self.open_orders.short.entry(idx).or_default().closes = vec![Order {
                     qty: self.positions.short[&idx].size.abs(),
                     price: round_(
                         f64::max(
@@ -967,10 +1069,14 @@ impl<'a> Backtest<'a> {
                         ),
                         self.exchange_params_list[idx].price_step,
                     ),
-                    order_type: OrderType::CloseUnstuckLong,
-                }]
-                .to_vec();
-                self.open_orders.short.entry(idx).or_default().entries = Vec::new();
+                    order_type: OrderType::CloseUnstuckShort,
+                }];
+                self.open_orders
+                    .short
+                    .entry(idx)
+                    .or_default()
+                    .entries
+                    .clear();
                 return;
             }
         }
@@ -1036,7 +1142,7 @@ impl<'a> Backtest<'a> {
 
         if self.bot_params_pair.long.unstuck_loss_allowance_pct > 0.0 {
             unstuck_allowances.0 = calc_auto_unstuck_allowance(
-                self.balance,
+                self.balance.usd_total_rounded,
                 self.bot_params_pair.long.unstuck_loss_allowance_pct
                     * self.bot_params_pair.long.total_wallet_exposure_limit,
                 self.pnl_cumsum_max,
@@ -1051,7 +1157,7 @@ impl<'a> Backtest<'a> {
                     let position = &self.positions.long[&idx];
                     let wallet_exposure = calc_wallet_exposure(
                         self.exchange_params_list[idx].c_mult,
-                        self.balance,
+                        self.balance.usd_total_rounded,
                         position.size,
                         position.price,
                     );
@@ -1068,7 +1174,7 @@ impl<'a> Backtest<'a> {
 
         if self.bot_params_pair.short.unstuck_loss_allowance_pct > 0.0 {
             unstuck_allowances.1 = calc_auto_unstuck_allowance(
-                self.balance,
+                self.balance.usd_total_rounded,
                 self.bot_params_pair.short.unstuck_loss_allowance_pct
                     * self.bot_params_pair.short.total_wallet_exposure_limit,
                 self.pnl_cumsum_max,
@@ -1084,7 +1190,7 @@ impl<'a> Backtest<'a> {
                     let position = &self.positions.short[&idx];
                     let wallet_exposure = calc_wallet_exposure(
                         self.exchange_params_list[idx].c_mult,
-                        self.balance,
+                        self.balance.usd_total_rounded,
                         position.size,
                         position.price,
                     );
@@ -1134,7 +1240,7 @@ impl<'a> Backtest<'a> {
                                 min_entry_qty,
                                 round_dn(
                                     cost_to_qty(
-                                        self.balance
+                                        self.balance.usd_total_rounded
                                             * self.bot_params_pair.long.wallet_exposure_limit
                                             * self.bot_params_pair.long.unstuck_close_pct,
                                         close_price,
@@ -1200,7 +1306,7 @@ impl<'a> Backtest<'a> {
                                 min_entry_qty,
                                 round_dn(
                                     cost_to_qty(
-                                        self.balance
+                                        self.balance.usd_total_rounded
                                             * self.bot_params_pair.short.wallet_exposure_limit
                                             * self.bot_params_pair.short.unstuck_close_pct,
                                         close_price,
@@ -1302,18 +1408,18 @@ impl<'a> Backtest<'a> {
                 LONG => {
                     self.open_orders
                         .long
-                        .get_mut(&unstucking_idx)
-                        .unwrap()
-                        .closes = [unstucking_close].to_vec();
+                        .entry(unstucking_idx)
+                        .or_default()
+                        .closes = vec![unstucking_close];
                 }
                 SHORT => {
                     self.open_orders
                         .short
-                        .get_mut(&unstucking_idx)
-                        .unwrap()
-                        .closes = [unstucking_close].to_vec();
+                        .entry(unstucking_idx)
+                        .or_default()
+                        .closes = vec![unstucking_close];
                 }
-                _ => panic!("Invalid unstucking_pside"),
+                _ => unreachable!(),
             }
         }
     }
@@ -1420,14 +1526,6 @@ impl<'a> Backtest<'a> {
         }
     }
 
-    fn update_open_orders(&mut self, k: usize) {
-        if (!self.did_fill_long.is_empty() || !self.did_fill_short.is_empty()) {
-            self.update_open_orders_any_fill(k);
-        } else {
-            self.update_open_orders_no_fill(k);
-        }
-    }
-
     #[inline]
     fn update_emas(&mut self, k: usize) {
         for i in 0..self.n_coins {
@@ -1446,6 +1544,56 @@ impl<'a> Backtest<'a> {
             }
         }
     }
+}
+
+/// Binary-search the **first** and **last** valid candle index for every coin.
+/// A candle is *invalid* when `high == low == close` **and** `volume <= 0.0`
+/// (volume is -1.0 in new data, 0.0 in older back/front-filled data).
+fn find_valid_timestamp_bounds(hlcvs: &ArrayView3<f64>) -> (Vec<usize>, Vec<usize>) {
+    let n_ts = hlcvs.shape()[0];
+    let n_coins = hlcvs.shape()[1];
+    let mut firsts = vec![0; n_coins];
+    let mut lasts = vec![0; n_coins];
+
+    for idx in 0..n_coins {
+        // helper closure to keep the predicate in one place
+        let is_invalid = |k: usize| {
+            let row = hlcvs.slice(s![k, idx, ..]);
+            row[HIGH] == row[LOW] && row[HIGH] == row[CLOSE] && row[VOLUME] <= 0.0
+        };
+
+        /* ---------- first valid ---------- */
+        let (mut lo, mut hi) = (0usize, n_ts - 1);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if is_invalid(mid) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        // market never became valid
+        if is_invalid(lo) {
+            firsts[idx] = n_ts; // or usize::MAX – choose a sentinel
+            lasts[idx] = n_ts;
+            continue; // next coin
+        }
+        firsts[idx] = lo;
+
+        /* ---------- last valid ---------- */
+        let (mut lo2, mut hi2) = (lo, n_ts - 1); // <-- start at first_valid
+        while lo2 < hi2 {
+            let mid = (lo2 + hi2 + 1) / 2; // bias to upper half
+            if is_invalid(mid) {
+                hi2 = mid - 1;
+            } else {
+                lo2 = mid;
+            }
+        }
+        lasts[idx] = lo2;
+    }
+    (firsts, lasts)
 }
 
 fn calc_ema_alphas(bot_params_pair: &BotParamsPair) -> EmaAlphas {
@@ -1486,33 +1634,55 @@ fn analyze_backtest_basic(fills: &[Fill], equities: &Vec<f64>) -> Analysis {
         return Analysis::default();
     }
     // Calculate daily equities
-    let mut daily_eqs = Vec::new();
+    let mut daily_eqs = Vec::new(); // stores last equity of each day
+    let mut daily_eqs_mins = Vec::new(); // stores min equity of each day
+
     let mut current_day = 0;
     let mut current_min = equities[0];
+    let mut last_equity = equities[0];
 
     for (i, &equity) in equities.iter().enumerate() {
         let day = i / 1440;
         if day > current_day {
-            daily_eqs.push(current_min);
+            daily_eqs.push(last_equity);
+            daily_eqs_mins.push(current_min);
             current_day = day;
             current_min = equity;
         } else {
             current_min = current_min.min(equity);
         }
+        last_equity = equity;
     }
-    if current_min != f64::INFINITY {
-        daily_eqs.push(current_min);
+
+    // Push final day’s values
+    if !equities.is_empty() {
+        daily_eqs.push(last_equity);
+        daily_eqs_mins.push(current_min);
     }
 
     // Calculate daily percentage changes
     let daily_eqs_pct_change: Vec<f64> =
         daily_eqs.windows(2).map(|w| (w[1] - w[0]) / w[0]).collect();
+    let daily_eqs_mins_pct_change: Vec<f64> = daily_eqs_mins
+        .windows(2)
+        .map(|w| (w[1] - w[0]) / w[0])
+        .collect();
 
     // Calculate ADG and standard metrics
-    let adg = daily_eqs_pct_change.iter().sum::<f64>() / daily_eqs_pct_change.len() as f64;
+    let (gain, adg) = smoothed_terminal_geometric_gain_and_adg(&daily_eqs);
     let mdg = {
         let mut sorted_pct_change = daily_eqs_pct_change.clone();
-        sorted_pct_change.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        sorted_pct_change.sort_by(|a, b| {
+            a.partial_cmp(b).unwrap_or_else(|| {
+                if a.is_nan() && b.is_nan() {
+                    Ordering::Equal
+                } else if a.is_nan() {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            })
+        });
         if sorted_pct_change.len() % 2 == 0 {
             (sorted_pct_change[sorted_pct_change.len() / 2 - 1]
                 + sorted_pct_change[sorted_pct_change.len() / 2])
@@ -1523,18 +1693,18 @@ fn analyze_backtest_basic(fills: &[Fill], equities: &Vec<f64>) -> Analysis {
     };
 
     // Calculate variance and standard deviation
-    let variance = daily_eqs_pct_change
+    let variance = daily_eqs_mins_pct_change
         .iter()
         .map(|&x| (x - adg).powi(2))
         .sum::<f64>()
-        / daily_eqs_pct_change.len() as f64;
+        / daily_eqs_mins_pct_change.len() as f64;
     let std_dev = variance.sqrt();
 
     // Calculate Sharpe Ratio
     let sharpe_ratio = if std_dev != 0.0 { adg / std_dev } else { 0.0 };
 
     // Calculate Sortino Ratio (using downside deviation)
-    let downside_returns: Vec<f64> = daily_eqs_pct_change
+    let downside_returns: Vec<f64> = daily_eqs_mins_pct_change
         .iter()
         .filter(|&&x| x < 0.0)
         .cloned()
@@ -1570,9 +1740,19 @@ fn analyze_backtest_basic(fills: &[Fill], equities: &Vec<f64>) -> Analysis {
 
     // Calculate Expected Shortfall (99%)
     let expected_shortfall_1pct = {
-        let mut sorted_returns = daily_eqs_pct_change.clone();
-        sorted_returns.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-        let cutoff_index = (daily_eqs_pct_change.len() as f64 * 0.01) as usize;
+        let mut sorted_returns = daily_eqs_mins_pct_change.clone();
+        sorted_returns.sort_by(|a, b| {
+            a.partial_cmp(b).unwrap_or_else(|| {
+                if a.is_nan() && b.is_nan() {
+                    Ordering::Equal
+                } else if a.is_nan() {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            })
+        });
+        let cutoff_index = (daily_eqs_mins_pct_change.len() as f64 * 0.01) as usize;
         if cutoff_index > 0 {
             sorted_returns[..cutoff_index]
                 .iter()
@@ -1585,10 +1765,20 @@ fn analyze_backtest_basic(fills: &[Fill], equities: &Vec<f64>) -> Analysis {
     };
 
     // Calculate drawdowns
-    let drawdowns = calc_drawdowns(&daily_eqs);
+    let drawdowns = calc_drawdowns(&daily_eqs_mins);
     let drawdown_worst_mean_1pct = {
         let mut sorted_drawdowns = drawdowns.clone();
-        sorted_drawdowns.sort_by(|a, b| b.abs().partial_cmp(&a.abs()).unwrap_or(Ordering::Equal));
+        sorted_drawdowns.sort_by(|a, b| {
+            a.partial_cmp(b).unwrap_or_else(|| {
+                if a.is_nan() && b.is_nan() {
+                    Ordering::Equal
+                } else if a.is_nan() {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            })
+        });
         let cutoff_index = std::cmp::max(1, (sorted_drawdowns.len() as f64 * 0.01) as usize);
         let worst_n = std::cmp::min(cutoff_index, sorted_drawdowns.len());
         sorted_drawdowns[..worst_n]
@@ -1619,12 +1809,12 @@ fn analyze_backtest_basic(fills: &[Fill], equities: &Vec<f64>) -> Analysis {
     // Calculate equity-balance differences
     let mut bal_eq = Vec::with_capacity(equities.len());
     let mut fill_iter = fills.iter().peekable();
-    let mut last_balance = fills[0].balance;
+    let mut last_balance = fills[0].balance_usd_total;
 
     for (i, &equity) in equities.iter().enumerate() {
         while let Some(fill) = fill_iter.peek() {
             if fill.index <= i {
-                last_balance = fill.balance;
+                last_balance = fill.balance_usd_total;
                 fill_iter.next();
             } else {
                 break;
@@ -1660,8 +1850,6 @@ fn analyze_backtest_basic(fills: &[Fill], equities: &Vec<f64>) -> Analysis {
         0.0
     };
 
-    let gain = fills[fills.len() - 1].balance / fills[0].balance;
-
     // Calculate profit factor
     let (total_profit, total_loss) = fills.iter().fold((0.0, 0.0), |(profit, loss), fill| {
         if fill.pnl > 0.0 {
@@ -1676,37 +1864,51 @@ fn analyze_backtest_basic(fills: &[Fill], equities: &Vec<f64>) -> Analysis {
         total_loss / total_profit
     };
 
-    // Calculate position durations
-    let mut positions_opened: HashMap<String, usize> = HashMap::new();
-    let mut durations: Vec<usize> = Vec::new();
+    // Calculate position durations and position_unchanged_hours_max
+    let mut positions_opened: HashMap<String, usize> = HashMap::new(); // Tracks position open time
+    let mut durations: Vec<usize> = Vec::new(); // Total position durations
+    let mut last_fill_time: HashMap<String, usize> = HashMap::new(); // Last fill time per position
+    let mut unchanged_durations: Vec<usize> = Vec::new(); // Durations of unchanged periods
 
     for fill in fills {
-        let key = format!(
-            "{}_{}",
-            fill.coin,
-            if fill.order_type.to_string().contains("long") {
-                "long"
-            } else {
-                "short"
-            }
-        );
+        let side = if fill.order_type.to_string().contains("long") {
+            "long"
+        } else {
+            "short"
+        };
+        let key = format!("{}_{}", fill.coin, side);
 
+        // Record the opening time if the position is new
         if !positions_opened.contains_key(&key) {
             positions_opened.insert(key.clone(), fill.index);
+            last_fill_time.insert(key.clone(), fill.index); // Initialize last fill time
         }
 
+        // Calculate unchanged duration since the last fill
+        if let Some(&last_time) = last_fill_time.get(&key) {
+            let unchanged_duration = fill.index - last_time;
+            unchanged_durations.push(unchanged_duration);
+        }
+        // Update the last fill time
+        last_fill_time.insert(key.clone(), fill.index);
+
+        // If the position is fully closed, calculate total duration and reset
         if fill.position_size == 0.0 {
             if let Some(&start_idx) = positions_opened.get(&key) {
                 durations.push(fill.index - start_idx);
                 positions_opened.remove(&key);
+                last_fill_time.remove(&key); // Reset tracking
             }
         }
     }
 
-    // Add remaining open positions
+    // Add unchanged durations and total durations for remaining open positions
     let last_index = fills.last().map_or(0, |f| f.index);
-    for (_key, &start_idx) in positions_opened.iter() {
-        durations.push(last_index - start_idx);
+    for (key, &start_idx) in positions_opened.iter() {
+        durations.push(last_index - start_idx); // Total duration for open positions
+        if let Some(&last_time) = last_fill_time.get(key) {
+            unchanged_durations.push(last_index - last_time); // Unchanged duration till end
+        }
     }
 
     // Calculate duration statistics
@@ -1738,6 +1940,17 @@ fn analyze_backtest_basic(fills: &[Fill], equities: &Vec<f64>) -> Analysis {
         0.0
     };
 
+    let position_unchanged_hours_max = if !unchanged_durations.is_empty() {
+        *unchanged_durations.iter().max().unwrap() as f64 / 60.0
+    } else {
+        0.0
+    };
+    let equity_choppiness = calc_equity_choppiness(&daily_eqs);
+    let equity_jerkiness = calc_equity_jerkiness(&daily_eqs);
+    let exponential_fit_error = calc_exponential_fit_error(&daily_eqs);
+
+    let volume_pct_per_day_avg = calc_avg_volume_pct_per_day(fills);
+
     let mut analysis = Analysis::default();
     analysis.adg = adg;
     analysis.mdg = mdg;
@@ -1759,6 +1972,11 @@ fn analyze_backtest_basic(fills: &[Fill], equities: &Vec<f64>) -> Analysis {
     analysis.position_held_hours_mean = position_held_hours_mean;
     analysis.position_held_hours_max = position_held_hours_max;
     analysis.position_held_hours_median = position_held_hours_median;
+    analysis.position_unchanged_hours_max = position_unchanged_hours_max;
+    analysis.equity_choppiness = equity_choppiness;
+    analysis.equity_jerkiness = equity_jerkiness;
+    analysis.exponential_fit_error = exponential_fit_error;
+    analysis.volume_pct_per_day_avg = volume_pct_per_day_avg;
 
     analysis
 }
@@ -1822,8 +2040,47 @@ pub fn analyze_backtest(fills: &[Fill], equities: &Vec<f64>) -> Analysis {
         .map(|a| a.loss_profit_ratio)
         .sum::<f64>()
         / 10.0;
-
+    analysis.equity_choppiness_w = subset_analyses
+        .iter()
+        .map(|a| a.equity_choppiness)
+        .sum::<f64>()
+        / 10.0;
+    analysis.equity_jerkiness_w = subset_analyses
+        .iter()
+        .map(|a| a.equity_jerkiness)
+        .sum::<f64>()
+        / 10.0;
+    analysis.exponential_fit_error_w = subset_analyses
+        .iter()
+        .map(|a| a.exponential_fit_error)
+        .sum::<f64>()
+        / 10.0;
+    analysis.volume_pct_per_day_avg_w = subset_analyses
+        .iter()
+        .map(|a| a.volume_pct_per_day_avg)
+        .sum::<f64>()
+        / 10.0;
     analysis
+}
+
+/// Returns (Analysis in USD, Analysis in BTC).
+/// If `balance.use_btc_collateral == false`, both are identical.
+pub fn analyze_backtest_pair(
+    fills: &[Fill],
+    equities: &Equities,
+    use_btc_collateral: bool,
+) -> (Analysis, Analysis) {
+    let analysis_usd = analyze_backtest(fills, &equities.usd);
+    if !use_btc_collateral {
+        return (analysis_usd.clone(), analysis_usd);
+    }
+    let mut btc_fills = fills.to_vec();
+    for fill in btc_fills.iter_mut() {
+        fill.balance_usd_total /= fill.btc_price; // Use actual BTC balance if available
+        fill.pnl = fill.pnl / fill.btc_price; // Convert PNL to BTC
+    }
+    let analysis_btc = analyze_backtest(&btc_fills, &equities.btc);
+    (analysis_usd, analysis_btc)
 }
 
 fn calc_drawdowns(equity_series: &[f64]) -> Vec<f64> {
@@ -1842,4 +2099,126 @@ fn calc_drawdowns(equity_series: &[f64]) -> Vec<f64> {
         .zip(cumulative_max.iter())
         .map(|(&ret, &max)| (ret - max) / max)
         .collect()
+}
+
+/// Calculates the normalized total variation (sum of absolute first differences divided by net equity gain)
+pub fn calc_equity_choppiness(equity: &[f64]) -> f64 {
+    if equity.len() < 2 {
+        return 0.0;
+    }
+    let variation: f64 = equity.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
+    let net_gain = equity.last().unwrap() - equity[0];
+    if net_gain.abs() < f64::EPSILON {
+        return f64::INFINITY; // Prevent division by near-zero
+    }
+    variation / net_gain.abs()
+}
+
+/// Calculates the normalized mean absolute second derivative
+/// (each second difference is divided by the mean of the 3 equity points)
+pub fn calc_equity_jerkiness(equity: &[f64]) -> f64 {
+    if equity.len() < 3 {
+        return 0.0;
+    }
+    equity
+        .windows(3)
+        .map(|w| {
+            let numerator = (w[2] - 2.0 * w[1] + w[0]).abs();
+            let denom = (w[0] + w[1] + w[2]) / 3.0;
+            if denom.abs() < f64::EPSILON {
+                0.0
+            } else {
+                numerator / denom.abs()
+            }
+        })
+        .sum::<f64>()
+        / (equity.len() - 2) as f64
+}
+
+/// Calculates the mean squared error from a log-linear (exponential) fit
+pub fn calc_exponential_fit_error(equity: &[f64]) -> f64 {
+    if equity.len() < 2 || equity.iter().any(|&x| x <= 0.0) {
+        return f64::INFINITY;
+    }
+
+    let n = equity.len();
+    let x: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let log_y: Vec<f64> = equity.iter().map(|&y| y.ln()).collect();
+
+    let sum_x = x.iter().sum::<f64>();
+    let sum_y = log_y.iter().sum::<f64>();
+    let sum_xx = x.iter().map(|v| v * v).sum::<f64>();
+    let sum_xy = x.iter().zip(log_y.iter()).map(|(x, y)| x * y).sum::<f64>();
+
+    let denom = (n as f64 * sum_xx - sum_x * sum_x);
+    if denom == 0.0 {
+        return f64::INFINITY;
+    }
+
+    let slope = (n as f64 * sum_xy - sum_x * sum_y) / denom;
+    let intercept = (sum_y - slope * sum_x) / n as f64;
+
+    let mse = x
+        .iter()
+        .zip(log_y.iter())
+        .map(|(x_i, y_i)| {
+            let y_hat = slope * x_i + intercept;
+            (y_hat - y_i).powi(2)
+        })
+        .sum::<f64>()
+        / n as f64;
+
+    mse
+}
+
+/// Applies EMA smoothing (span=3) to daily equity values and computes geometric mean growth rate
+pub fn smoothed_terminal_geometric_gain_and_adg(daily_eqs: &[f64]) -> (f64, f64) {
+    if daily_eqs.len() < 2 {
+        return (0.0, 0.0);
+    }
+    if daily_eqs[0] <= 0.0 {
+        return (f64::INFINITY, f64::INFINITY);
+    }
+    let alpha = 2.0 / (3.0 + 1.0); // span = 3 → alpha = 0.5
+    let mut smoothed = Vec::with_capacity(daily_eqs.len());
+    smoothed.push(daily_eqs[0]);
+    for i in 1..daily_eqs.len() {
+        let prev = *smoothed.last().unwrap();
+        let current = alpha * daily_eqs[i] + (1.0 - alpha) * prev;
+        smoothed.push(current);
+    }
+
+    let start = smoothed[0];
+    let end = *smoothed.last().unwrap();
+    if end <= 0.0 {
+        return (-1.0, -1.0);
+    }
+    let n_days = daily_eqs.len() as f64;
+    let gain = end / start;
+    (gain, gain.powf(1.0 / n_days) - 1.0)
+}
+
+/// Calculates average volume per day as a percentage of balance.
+/// For each fill: abs(qty) * price / balance_at_fill
+pub fn calc_avg_volume_pct_per_day(fills: &[Fill]) -> f64 {
+    if fills.is_empty() {
+        return 0.0;
+    }
+
+    // Use a HashMap to sum cost_pct per day
+    use std::collections::HashMap;
+    let mut daily_totals: HashMap<usize, f64> = HashMap::new();
+
+    for fill in fills {
+        let day = fill.index / 1440;
+        let cost_pct = (fill.fill_qty.abs() * fill.fill_price) / fill.balance_usd_total;
+        *daily_totals.entry(day).or_insert(0.0) += cost_pct;
+    }
+
+    let total_days = daily_totals.len() as f64;
+    if total_days == 0.0 {
+        0.0
+    } else {
+        daily_totals.values().sum::<f64>() / total_days
+    }
 }

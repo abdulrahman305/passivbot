@@ -33,8 +33,8 @@ from procedures import (
     update_config_with_args,
     format_config,
     print_async_exception,
-    coin_to_symbol,
     read_external_coins_lists,
+    normalize_coins_source,
 )
 from njit_funcs import (
     calc_ema,
@@ -64,6 +64,7 @@ from pure_funcs import (
     get_template_live_config,
     flatten,
     log_dict_changes,
+    coin_to_symbol,
 )
 
 
@@ -72,6 +73,8 @@ logging.basicConfig(
     level=logging.INFO,
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
+
+ONE_MIN_MS = 60_000
 
 
 def signal_handler(sig, frame):
@@ -119,7 +122,6 @@ class Passivbot:
         self.fetched_open_orders = []
         self.open_orders = {}
         self.positions = {}
-        self.pnls = []
         self.symbol_ids = {}
         self.min_costs = {}
         self.min_qtys = {}
@@ -133,9 +135,6 @@ class Passivbot:
         self.ohlcvs_1m_cache_dirpath = make_get_filepath(f"caches/{self.exchange}/ohlcvs_1m/")
         self.previous_REST_update_ts = 0
         self.recent_fill = False
-        self.execution_delay_millis = max(
-            3000.0, self.config["live"]["execution_delay_seconds"] * 1000
-        )
         self.quote = "USDT"
 
         self.minimum_market_age_millis = (
@@ -158,6 +157,10 @@ class Passivbot:
         }
         self.create_ccxt_sessions()
         self.debug_mode = False
+        self.balance_threshold = 1.0  # don't create orders if balance is less than threshold
+        self.mimic_backtest_1m_delay = self.config["live"].get("mimic_backtest_1m_delay", False)
+        self.hyst_rounding_balance_pct = 0.02
+        self.hyst_rounding_balance_h = 0.5
 
     async def start_bot(self):
         logging.info(f"Starting bot {self.exchange}...")
@@ -219,6 +222,10 @@ class Passivbot:
         self.n_symbols_missing_ohlcvs_1m = len(self.get_symbols_approved_or_has_pos())
         if self.is_forager_mode():
             await self.update_first_timestamps()
+
+    def debug_print(self, *args):
+        if hasattr(self, "debug_mode") and self.debug_mode:
+            print(*args)
 
     async def init_flags(self):
         self.flags = {}
@@ -296,14 +303,39 @@ class Passivbot:
         if coinf in self.coin_to_symbol_map:
             self.coin_to_symbol_map[coin] = self.coin_to_symbol_map[coinf]
             return self.coin_to_symbol_map[coinf]
-        result = coin_to_symbol(
-            coin,
-            eligible_symbols=self.eligible_symbols,
-            quote=self.quote,
-            verbose=verbose,
-        )
+        result = coin_to_symbol(coin, self.eligible_symbols, self.quote)
         self.coin_to_symbol_map[coin] = result
         return result
+
+    def order_to_order_tuple(self, order):
+        return (
+            order["symbol"],
+            order["side"],
+            order["position_side"],
+            round(float(order["qty"]), 12),
+            round(float(order["price"]), 12),
+        )
+
+    def handle_backtest_mimic(self, orders_sent=None):
+        if not self.mimic_backtest_1m_delay:
+            return
+        if not hasattr(self, "whole_minute_cache"):
+            self.whole_minute_cache = {
+                "positions": None,
+                "ideal_orders": None,
+                "orders_sent": None,
+                "whole_minute": 0.0,
+            }
+        whole_minute = int(utc_ms() // ONE_MIN_MS * ONE_MIN_MS)
+        if whole_minute > self.whole_minute_cache.get("whole_minute", 0.0):
+            # we are in new whole minute
+            self.whole_minute_cache["ideal_orders"] = self.calc_ideal_orders()
+            self.whole_minute_cache["positions"] = deepcopy(self.positions)
+            self.whole_minute_cache["orders_sent"] = set()
+            self.whole_minute_cache["whole_minute"] = whole_minute
+        if orders_sent is not None:
+            for order in orders_sent:
+                self.whole_minute_cache["orders_sent"].add(self.order_to_order_tuple(order))
 
     async def run_execution_loop(self):
         while not self.stop_signal_received:
@@ -313,9 +345,13 @@ class Passivbot:
                     self.previous_REST_update_ts = utc_ms()
                     await self.prepare_for_execution()
                 await self.execute_to_exchange()
-                await asyncio.sleep(
-                    max(0.0, self.config["live"]["execution_delay_seconds"] - (utc_ms() - now) / 1000)
+                sleep_duration = (
+                    self.config["live"]["execution_delay_seconds"] - (utc_ms() - now) / 1000
                 )
+                if self.mimic_backtest_1m_delay:
+                    seconds_until_whole_minute = (ONE_MIN_MS - utc_ms() % ONE_MIN_MS) / 1000
+                    sleep_duration = min(sleep_duration, seconds_until_whole_minute)
+                await asyncio.sleep(max(0.0, sleep_duration))
             except Exception as e:
                 logging.error(f"error with {get_function_name()} {e}")
                 traceback.print_exc()
@@ -358,26 +394,18 @@ class Passivbot:
             # for x in to_cancel:
             #    pprint.pprint(x)
         else:
-            res = await self.execute_cancellations(
-                to_cancel[: self.config["live"]["max_n_cancellations_per_batch"]]
-            )
-            if res:
-                for elm in res:
-                    self.remove_order(elm, source="POST")
+            res = await self.execute_cancellations_parent(to_cancel)
         if self.debug_mode:
             if to_create:
                 print(f"would create {len(to_create)} orders")
             # for x in to_create:
             #    pprint.pprint(x)
+        elif self.balance < self.balance_threshold:
+            logging.info(f"Balance too low: {self.balance} {self.quote}. Not creating any orders.")
         else:
             res = None
             try:
-                res = await self.execute_orders(
-                    to_create[: self.config["live"]["max_n_creations_per_batch"]]
-                )
-                if res:
-                    for elm in res:
-                        self.add_new_order(elm, source="POST")
+                res = await self.execute_orders_parent(to_create)
             except Exception as e:
                 logging.error(f"error executing orders {to_create} {e}")
                 print_async_exception(res)
@@ -387,6 +415,97 @@ class Passivbot:
             self.previous_REST_update_ts = 0
         if self.debug_mode:
             return to_cancel, to_create
+
+    async def execute_orders_parent(self, orders: [dict]) -> [dict]:
+        orders = orders[: self.config["live"]["max_n_creations_per_batch"]]
+        res = await self.execute_orders(orders)
+        if not res:
+            return
+        if len(orders) != len(res):
+            print(
+                f"debug unequal lengths execute_orders_parent: "
+                f"{len(orders)} orders, {len(res)} executions",
+                res,
+            )
+            return []
+        to_return = []
+        for ex, od in zip(res, orders):
+            if not self.did_create_order(ex):
+                print(f"debug did_create_order false {ex}")
+                continue
+            debug_prints = {}
+            for key in od:
+                if key not in ex:
+                    debug_prints.setdefault("missing", []).append((key, od[key]))
+                    ex[key] = od[key]
+                elif ex[key] is None:
+                    debug_prints.setdefault("is_none", []).append((key, od[key]))
+                    ex[key] = od[key]
+            if debug_prints and self.debug_mode:
+                print("debug create_orders", debug_prints)
+            to_return.append(ex)
+        if to_return:
+            self.handle_backtest_mimic(to_return)
+            for elm in to_return:
+                self.add_new_order(elm, source="POST")
+        return to_return
+
+    async def execute_cancellations_parent(self, orders: [dict]) -> [dict]:
+        if len(orders) > self.config["live"]["max_n_cancellations_per_batch"]:
+            # prioritize cancelling reduce-only orders
+            try:
+                reduce_only_orders = [
+                    x for x in orders if x.get("reduce_only") or x.get("reduceOnly")
+                ]
+                rest = [x for x in orders if not x["reduce_only"]]
+                orders = (reduce_only_orders + rest)[
+                    : self.config["live"]["max_n_cancellations_per_batch"]
+                ]
+            except Exception as e:
+                logging.error(f"debug filter cancellations {e}")
+                orders = orders[: self.config["live"]["max_n_cancellations_per_batch"]]
+        res = await self.execute_cancellations(orders)
+        to_return = []
+        if len(orders) != len(res):
+            print(
+                f"debug unequal lengths execute_cancellations_parent: "
+                f"{len(orders)} orders, {len(res)} executions",
+                res,
+            )
+            return []
+        for ex, od in zip(res, orders):
+            if not self.did_cancel_order(ex):
+                print(f"debug did_cancel_order false {ex}")
+                continue
+            debug_prints = {}
+            for key in od:
+                if key not in ex:
+                    debug_prints.setdefault("missing", []).append((key, od[key]))
+                    ex[key] = od[key]
+                elif ex[key] is None:
+                    debug_prints.setdefault("is_none", []).append((key, od[key]))
+                    ex[key] = od[key]
+            if debug_prints and self.debug_mode:
+                print("debug cancel_orders", debug_prints)
+            to_return.append(ex)
+        if to_return:
+            for elm in to_return:
+                self.remove_order(elm, source="POST")
+        return to_return
+
+    def did_create_order(self, executed) -> bool:
+        try:
+            return "id" in executed and executed["id"] is not None
+        except:
+            return False
+        # further tests defined in child class
+
+    def did_cancel_order(self, executed) -> bool:
+        try:
+            return "id" in executed and executed["id"] is not None
+        except:
+            return False
+        # further tests defined in child class
 
     def is_forager_mode(self, pside=None):
         if pside is None:
@@ -398,7 +517,7 @@ class Passivbot:
         n_positions = self.get_max_n_positions(pside)
         if n_positions == 0:
             return False
-        if n_positions >= len(self.approved_coins[pside]):
+        if n_positions >= len(self.approved_coins_minus_ignored_coins[pside]):
             return False
         return True
 
@@ -408,8 +527,9 @@ class Passivbot:
             "total_wallet_exposure_limit",
             "unstuck_loss_allowance_pct",
             "unstuck_close_pct",
-            "filter_rolling_window",
-            "filter_relative_volume_clip_pct",
+            "filter_noisiness_rolling_window",
+            "filter_volume_rolling_window",
+            "filter_volume_drop_pct",
         }  # skip parameters affecting global behavior
         for pside in ["long", "short"]:
             self.config["bot"][pside]["n_positions"] = min(
@@ -653,7 +773,7 @@ class Passivbot:
             return symbol
 
     def is_approved(self, pside, symbol) -> bool:
-        if symbol not in self.approved_coins[pside]:
+        if symbol not in self.approved_coins_minus_ignored_coins[pside]:
             return False
         if symbol in self.ignored_coins[pside]:
             return False
@@ -814,14 +934,16 @@ class Passivbot:
         # filter coins by min effective cost
         # filter coins by relative volume
         # filter coins by noisiness
+        if self.forced_modes[pside]:
+            return []
+        candidates = self.approved_coins_minus_ignored_coins[pside]
+        candidates = [s for s in candidates if self.is_old_enough(pside, s)]
+        candidates = [s for s in candidates if self.effective_min_cost_is_low_enough(pside, s)]
+        if candidates == []:
+            self.warn_on_high_effective_min_cost(pside)
         if self.is_forager_mode(pside):
-            candidates = self.approved_coins_minus_ignored_coins[pside]
-            candidates = [s for s in candidates if self.is_old_enough(pside, s)]
-            candidates = [s for s in candidates if self.effective_min_cost_is_low_enough(pside, s)]
-            if candidates == []:
-                self.warn_on_high_effective_min_cost(pside)
             # filter coins by relative volume and noisiness
-            clip_pct = self.config["bot"][pside]["filter_relative_volume_clip_pct"]
+            clip_pct = self.config["bot"][pside]["filter_volume_drop_pct"]
             max_n_positions = self.get_max_n_positions(pside)
             if clip_pct > 0.0:
                 volumes = self.calc_volumes(pside, symbols=candidates)
@@ -833,20 +955,22 @@ class Passivbot:
             noisiness = self.calc_noisiness(pside, eligible_symbols=candidates)
             noisiness = {k: v for k, v in sorted(noisiness.items(), key=lambda x: x[1], reverse=True)}
             ideal_coins = [k for k in noisiness.keys()][:max_n_positions]
-        elif self.forced_modes[pside]:
-            return []
         else:
-            # all approved coins are selected, no filtering
-            ideal_coins = sorted(self.approved_coins_minus_ignored_coins[pside])
+            # all approved coins are selected, no filtering by volume and noisiness
+            ideal_coins = sorted(candidates)
         return ideal_coins
 
     def warn_on_high_effective_min_cost(self, pside):
         if not self.config["live"]["filter_by_min_effective_cost"]:
             return
-        eligible_symbols_filtered = [
-            x for x in self.eligible_symbols if self.effective_min_cost_is_low_enough(pside, x)
+        if not self.is_pside_enabled(pside):
+            return
+        approved_coins_filtered = [
+            x
+            for x in self.approved_coins_minus_ignored_coins[pside]
+            if self.effective_min_cost_is_low_enough(pside, x)
         ]
-        if len(eligible_symbols_filtered) == 0:
+        if len(approved_coins_filtered) == 0:
             logging.info(
                 f"Warning: No {pside} symbols are approved due to min effective cost too high. "
                 + f"Suggestions: 1) increase account balance, 2) "
@@ -892,6 +1016,12 @@ class Passivbot:
             if n_positions == 0:
                 return 0.0
             return round(twel / n_positions, 8)
+
+    def is_pside_enabled(self, pside):
+        return (
+            self.config["bot"][pside]["total_wallet_exposure_limit"] > 0.0
+            and self.config["bot"][pside]["n_positions"] > 0.0
+        )
 
     def effective_min_cost_is_low_enough(self, pside, symbol):
         if not self.config["live"]["filter_by_min_effective_cost"]:
@@ -958,7 +1088,7 @@ class Passivbot:
                     self.recent_fill = True
                     self.previous_REST_update_ts = 0
                     self.remove_order(upd, source="WS", reason="   filled")
-                elif upd["status"] in ["canceled", "cancelled", "expired", "rejected"]:
+                elif upd["status"].lower() in ["canceled", "cancelled", "expired", "rejected"]:
                     # remove order from open_orders
                     self.remove_order(
                         upd, source="WS", reason=upd["status"].replace("canceled", "cancelled")
@@ -1015,7 +1145,7 @@ class Passivbot:
     async def init_pnls(self):
         if not hasattr(self, "pnls"):
             self.pnls = []
-        elif self.pnls:
+        else:
             return  # pnls already initiated; abort
         logging.info(f"initiating pnls...")
         age_limit = (
@@ -1062,11 +1192,8 @@ class Passivbot:
             self.get_exchange_time()
             - 1000 * 60 * 60 * 24 * self.config["live"]["pnls_max_lookback_days"]
         )
-        if not hasattr(self, "pnls"):
-            self.pnls = []
+        await self.init_pnls()  # will do nothing if already initiated
         old_ids = {elm["id"] for elm in self.pnls}
-        if len(self.pnls) == 0:
-            await self.init_pnls()
         start_time = self.pnls[-1]["timestamp"] - 1000 if self.pnls else age_limit
         res = await self.fetch_pnls(start_time=start_time, limit=100)
         if res in [None, False]:
@@ -1351,6 +1478,7 @@ class Passivbot:
                         self.live_configs[symbol][pside]["entry_grid_spacing_pct"],
                         self.live_configs[symbol][pside]["entry_initial_ema_dist"],
                         self.live_configs[symbol][pside]["entry_initial_qty_pct"],
+                        self.live_configs[symbol][pside]["entry_trailing_double_down_factor"],
                         self.live_configs[symbol][pside]["entry_trailing_grid_ratio"],
                         self.live_configs[symbol][pside]["entry_trailing_retracement_pct"],
                         self.live_configs[symbol][pside]["entry_trailing_threshold_pct"],
@@ -1369,8 +1497,8 @@ class Passivbot:
                         self.min_qtys[symbol],
                         self.min_costs[symbol],
                         self.c_mults[symbol],
-                        self.live_configs[symbol][pside]["close_grid_markup_range"],
-                        self.live_configs[symbol][pside]["close_grid_min_markup"],
+                        self.live_configs[symbol][pside]["close_grid_markup_end"],
+                        self.live_configs[symbol][pside]["close_grid_markup_start"],
                         self.live_configs[symbol][pside]["close_grid_qty_pct"],
                         self.live_configs[symbol][pside]["close_trailing_grid_ratio"],
                         self.live_configs[symbol][pside]["close_trailing_qty_pct"],
@@ -1439,6 +1567,19 @@ class Passivbot:
                     }
                 )
                 seen.add(seen_key)
+        # ensure close qtys don't exceed pos sizes
+        for symbol in ideal_orders_f:
+            for i in range(len(ideal_orders_f[symbol])):
+                order = ideal_orders_f[symbol][i]
+                if order["reduce_only"]:
+                    pos_size_abs = abs(
+                        self.positions[order["symbol"]][order["position_side"]]["size"]
+                    )
+                    if abs(order["qty"]) > pos_size_abs:
+                        logging.info(
+                            f"debug: reduce only order size greater than pos size. Order: {order} Position: {self.positions[order['symbol']]}"
+                        )
+                        order["qty"] = pos_size_abs
         return ideal_orders_f
 
     def calc_unstucking_close(self, ideal_orders):
@@ -1609,7 +1750,13 @@ class Passivbot:
         return "", (0.0, 0.0, "")
 
     def calc_orders_to_cancel_and_create(self):
-        ideal_orders = self.calc_ideal_orders()
+        if self.mimic_backtest_1m_delay:
+            self.handle_backtest_mimic()
+            ideal_orders = self.whole_minute_cache["ideal_orders"]
+            already_sent = self.whole_minute_cache["orders_sent"]
+        else:
+            ideal_orders = self.calc_ideal_orders()
+            already_sent = set()
         actual_orders = {}
         for symbol in self.active_symbols:
             actual_orders[symbol] = []
@@ -1680,7 +1827,17 @@ class Passivbot:
                 logging.info(f"debug: price missing sort to_cancel by mprice_diff {x} {e}")
                 to_cancel_with_mprice_diff.append((0.0, x))
         to_cancel_with_mprice_diff.sort(key=lambda x: x[0])
-        return [x[1] for x in to_cancel_with_mprice_diff], [x[1] for x in to_create_with_mprice_diff]
+        to_cancel = [
+            x[1]
+            for x in to_cancel_with_mprice_diff
+            if self.order_to_order_tuple(x[1]) not in already_sent
+        ]
+        to_create = [
+            x[1]
+            for x in to_create_with_mprice_diff
+            if self.order_to_order_tuple(x[1]) not in already_sent
+        ]
+        return to_cancel, to_create
 
     async def restart_bot_on_too_many_errors(self):
         if not hasattr(self, "error_counts"):
@@ -1726,21 +1883,21 @@ class Passivbot:
     def fill_gaps_ohlcvs_1m_single(self, symbol):
         if symbol not in self.ohlcvs_1m or not self.ohlcvs_1m[symbol]:
             return
-        now_minute = int(self.get_exchange_time() // 60000 * 60000)
+        now_minute = int(self.get_exchange_time() // ONE_MIN_MS * ONE_MIN_MS)
         last_ts, last_ohlcv_1m = self.ohlcvs_1m[symbol].peekitem(-1)
         if now_minute > last_ts:
             self.ohlcvs_1m[symbol][now_minute] = [float(now_minute)] + [last_ohlcv_1m[4]] * 4 + [0.0]
         n_ohlcvs_1m = len(self.ohlcvs_1m[symbol])
         range_ms = self.ohlcvs_1m[symbol].peekitem(-1)[0] - self.ohlcvs_1m[symbol].peekitem(0)[0]
-        ideal_n_ohlcvs_1m = int((range_ms) / 60000) + 1
+        ideal_n_ohlcvs_1m = int((range_ms) / ONE_MIN_MS) + 1
         if ideal_n_ohlcvs_1m > n_ohlcvs_1m:
             ts = self.ohlcvs_1m[symbol].peekitem(0)[0]
             last_ts = self.ohlcvs_1m[symbol].peekitem(-1)[0]
             while ts < last_ts:
-                ts += 60000
+                ts += ONE_MIN_MS
                 if ts not in self.ohlcvs_1m[symbol]:
                     self.ohlcvs_1m[symbol][ts] = (
-                        [float(ts)] + [self.ohlcvs_1m[symbol][ts - 60000][4]] * 4 + [0.0]
+                        [float(ts)] + [self.ohlcvs_1m[symbol][ts - ONE_MIN_MS][4]] * 4 + [0.0]
                     )
 
     def init_EMAs_single(self, symbol):
@@ -1773,7 +1930,7 @@ class Passivbot:
             if symbol not in self.emas["long"]:
                 self.init_EMAs_single(symbol)
             last_ts, last_ohlcv_1m = self.ohlcvs_1m[symbol].peekitem(-1)
-            mn = 60000
+            mn = ONE_MIN_MS
             for ts in range(self.upd_minute_emas[symbol] + mn, last_ts + mn, mn):
                 for pside in ["long", "short"]:
                     self.emas[pside][symbol] = calc_ema(
@@ -1931,7 +2088,7 @@ class Passivbot:
         if eligible_symbols is None:
             eligible_symbols = self.eligible_symbols
         noisiness = {}
-        n = int(round(self.config["bot"][pside]["filter_rolling_window"]))
+        n = int(round(self.config["bot"][pside]["filter_noisiness_rolling_window"]))
         for symbol in eligible_symbols:
             if symbol in self.ohlcvs_1m and self.ohlcvs_1m[symbol]:
                 ohlcvs_1m = [v for v in self.ohlcvs_1m[symbol].values()[-n:]]
@@ -1941,7 +2098,7 @@ class Passivbot:
         return noisiness
 
     def calc_volumes(self, pside, symbols=None):
-        n = int(round(self.config["bot"][pside]["filter_rolling_window"]))
+        n = int(round(self.config["bot"][pside]["filter_volume_rolling_window"]))
         volumes = {}
         if symbols is None:
             symbols = self.get_symbols_approved_or_has_pos(pside)
@@ -1957,30 +2114,36 @@ class Passivbot:
                 volumes[symbol] = 0.0
         return volumes
 
-    async def execute_multiple(self, orders: [dict], type_: str, max_n_executions: int):
+    async def execute_multiple(self, orders: [dict], type_: str):
         if not orders:
             return []
         executions = []
         any_exceptions = False
-        for order in orders[:max_n_executions]:  # sorted by PA dist
-            execution = None
+        for order in orders:  # sorted by PA dist
+            task = None
             try:
-                execution = asyncio.create_task(getattr(self, type_)(order))
-                executions.append((order, execution))
+                task = asyncio.create_task(getattr(self, type_)(order))
+                executions.append((order, task))
             except Exception as e:
                 logging.error(f"error executing {type_} {order} {e}")
-                print_async_exception(execution)
+                print_async_exception(task)
                 traceback.print_exc()
+                executions.append((order, e))
                 any_exceptions = True
         results = []
-        for execution in executions:
+        for order, execution in executions:
+            if isinstance(execution, Exception):
+                # Already failed at task creation time
+                results.append(execution)
+                continue
             result = None
             try:
-                result = await execution[1]
+                result = await execution
                 results.append(result)
             except Exception as e:
                 logging.error(f"error executing {type_} {execution} {e}")
                 print_async_exception(result)
+                results.append(e)
                 traceback.print_exc()
                 any_exceptions = True
         if any_exceptions:
@@ -2170,7 +2333,21 @@ class Passivbot:
         psides_equal = content["long"] == content["short"]
         for pside in content:
             if not psides_equal or symbols is None:
-                symbols = [self.coin_to_symbol(coin) for coin in content[pside]]
+                coins = content[pside]
+                # Check if coins is a single string that needs to be split
+                if isinstance(coins, str):
+                    coins = coins.split(",")
+                # Handle case where list contains comma-separated values in its elements
+                elif isinstance(coins, (list, tuple)):
+                    expanded_coins = []
+                    for item in coins:
+                        if isinstance(item, str) and "," in item:
+                            expanded_coins.extend(item.split(","))
+                        else:
+                            expanded_coins.append(item)
+                    coins = expanded_coins
+
+                symbols = [self.coin_to_symbol(coin) for coin in coins]
                 symbols = set([s for s in symbols if s])
             symbols_already = getattr(self, k_coins)[pside]
             if symbols and symbols_already != symbols:
@@ -2185,47 +2362,24 @@ class Passivbot:
                 getattr(self, k_coins)[pside] = symbols
 
     def refresh_approved_ignored_coins_lists(self):
-        # if config.live.approved_coins or config.live.approved_coins are external files,
-        # use content of files as approved/ignored coins
-        # approved/ignored coins may be list of coins or {'long': list, 'short': list}
-        for k_coins in ["approved_coins", "ignored_coins"]:
-            if not hasattr(self, k_coins):
-                setattr(self, k_coins, {"long": set(), "short": set()})
-            path = self.config["live"][k_coins]
-            if isinstance(path, list) and len(path) == 1 and isinstance(path[0], str):
-                path = path[0]
-            if isinstance(path, str):
-                if path == "":
-                    continue
-                if os.path.exists(path):
-                    try:
-                        content = read_external_coins_lists(path)
-                        if content:
-                            self.add_to_coins_lists(content, k_coins)
-                    except Exception as e:
-                        logging.error(f"Failed to read contents of {path} {e}")
-                elif self.coin_to_symbol(path):
-                    self.add_to_coins_lists({"long": [path], "short": [path]}, k_coins)
-                else:
-                    logging.error(
-                        f"error with refresh_approved_ignored_coins_lists: failed to load {path} {k_coins}"
-                    )
-            else:
-                try:
-                    if isinstance(path, (list, tuple)):
-                        self.add_to_coins_lists({"long": path, "short": path}, k_coins)
-                    elif isinstance(path, dict) and sorted(path) == ["long", "short"]:
-                        self.add_to_coins_lists(path, k_coins)
-                except Exception as e:
-                    logging.error(f"Failed to read {k_coins} from config: {path}")
-        self.approved_coins_minus_ignored_coins = {}
-        for pside in self.approved_coins:
-            if self.config["live"]["empty_means_all_approved"] and not self.approved_coins[pside]:
-                # if approved_coins is empty, all coins are approved
-                self.approved_coins[pside] = self.eligible_symbols
-            self.approved_coins_minus_ignored_coins[pside] = (
-                self.approved_coins[pside] - self.ignored_coins[pside]
-            )
+        try:
+            for k in ("approved_coins", "ignored_coins"):
+                if not hasattr(self, k):
+                    setattr(self, k, {"long": set(), "short": set()})
+                # single source‑of‑truth 🚀
+                parsed = normalize_coins_source(self.config["live"][k])
+                self.add_to_coins_lists(parsed, k)
+            self.approved_coins_minus_ignored_coins = {}
+            for pside in self.approved_coins:
+                if self.config["live"]["empty_means_all_approved"] and not self.approved_coins[pside]:
+                    # if approved_coins is empty, all coins are approved
+                    self.approved_coins[pside] = self.eligible_symbols
+                self.approved_coins_minus_ignored_coins[pside] = (
+                    self.approved_coins[pside] - self.ignored_coins[pside]
+                )
+        except Exception as e:
+            logging.error(f"error with refresh_approved_ignored_coins_lists {e}")
+            traceback.print_exc()
 
 
 def setup_bot(config):
@@ -2255,6 +2409,10 @@ def setup_bot(config):
         from exchanges.gateio import GateIOBot
 
         bot = GateIOBot(config)
+    elif user_info["exchange"] == "defx":
+        from exchanges.defx import DefxBot
+
+        bot = DefxBot(config)
     else:
         raise Exception(f"unknown exchange {user_info['exchange']}")
     return bot

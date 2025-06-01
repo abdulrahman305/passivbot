@@ -8,7 +8,6 @@ import json
 import re
 import numpy as np
 import dateutil.parser
-from njit_funcs import calc_pnl_long, calc_pnl_short
 import passivbot_rust as pbr
 
 try:
@@ -330,7 +329,7 @@ def get_utc_now_timestamp() -> int:
 
 def config_pretty_str(config: dict):
     pretty_str = pprint.pformat(config)
-    for r in [("'", '"'), ("True", "true"), ("False", "false")]:
+    for r in [("'", '"'), ("True", "true"), ("False", "false"), ("None", "null")]:
         pretty_str = pretty_str.replace(*r)
     return pretty_str
 
@@ -513,11 +512,12 @@ def get_template_live_config(passivbot_mode="v7"):
                 "gap_tolerance_ohlcvs_minutes": 120.0,
                 "start_date": "2021-04-01",
                 "starting_balance": 100000.0,
+                "use_btc_collateral": False,
             },
             "bot": {
                 "long": {
-                    "close_grid_markup_range": 0.0255,
-                    "close_grid_min_markup": 0.0089,
+                    "close_grid_markup_end": 0.0089,
+                    "close_grid_markup_start": 0.0344,
                     "close_grid_qty_pct": 0.125,
                     "close_trailing_grid_ratio": 0.5,
                     "close_trailing_qty_pct": 0.125,
@@ -531,11 +531,13 @@ def get_template_live_config(passivbot_mode="v7"):
                     "entry_grid_spacing_weight": 0.697,
                     "entry_initial_ema_dist": -0.00738,
                     "entry_initial_qty_pct": 0.00592,
+                    "entry_trailing_double_down_factor": 0.894,
                     "entry_trailing_grid_ratio": 0.5,
                     "entry_trailing_retracement_pct": 0.01,
                     "entry_trailing_threshold_pct": 0.05,
-                    "filter_rolling_window": 60,
-                    "filter_relative_volume_clip_pct": 0.95,
+                    "filter_noisiness_rolling_window": 60,
+                    "filter_volume_drop_pct": 0.95,
+                    "filter_volume_rolling_window": 60,
                     "n_positions": 10.0,
                     "total_wallet_exposure_limit": 1.7,
                     "unstuck_close_pct": 0.001,
@@ -544,8 +546,8 @@ def get_template_live_config(passivbot_mode="v7"):
                     "unstuck_threshold": 0.916,
                 },
                 "short": {
-                    "close_grid_markup_range": 0.0255,
-                    "close_grid_min_markup": 0.0089,
+                    "close_grid_markup_end": 0.0089,
+                    "close_grid_markup_start": 0.0344,
                     "close_grid_qty_pct": 0.125,
                     "close_trailing_grid_ratio": 0.5,
                     "close_trailing_qty_pct": 0.125,
@@ -559,11 +561,13 @@ def get_template_live_config(passivbot_mode="v7"):
                     "entry_grid_spacing_weight": 0.697,
                     "entry_initial_ema_dist": -0.00738,
                     "entry_initial_qty_pct": 0.00592,
+                    "entry_trailing_double_down_factor": 0.894,
                     "entry_trailing_grid_ratio": 0.5,
                     "entry_trailing_retracement_pct": 0.01,
                     "entry_trailing_threshold_pct": 0.05,
-                    "filter_rolling_window": 60,
-                    "filter_relative_volume_clip_pct": 0.95,
+                    "filter_noisiness_rolling_window": 60,
+                    "filter_volume_drop_pct": 0.95,
+                    "filter_volume_rolling_window": 60,
                     "n_positions": 10.0,
                     "total_wallet_exposure_limit": 1.7,
                     "unstuck_close_pct": 0.001,
@@ -581,12 +585,13 @@ def get_template_live_config(passivbot_mode="v7"):
                 "filter_by_min_effective_cost": True,
                 "forced_mode_long": "",
                 "forced_mode_short": "",
-                "ignored_coins": [],
+                "ignored_coins": {"long": [], "short": []},
                 "leverage": 10.0,
                 "market_orders_allowed": True,
                 "max_n_cancellations_per_batch": 5,
                 "max_n_creations_per_batch": 3,
                 "max_n_restarts_per_day": 10,
+                "mimic_backtest_1m_delay": False,
                 "minimum_coin_age_days": 7.0,
                 "ohlcvs_1m_rolling_window_days": 7.0,
                 "ohlcvs_1m_update_after_minutes": 10.0,
@@ -597,8 +602,8 @@ def get_template_live_config(passivbot_mode="v7"):
             },
             "optimize": {
                 "bounds": {
-                    "long_close_grid_markup_range": [0.0, 0.03],
-                    "long_close_grid_min_markup": [0.001, 0.03],
+                    "long_close_grid_markup_end": [0.001, 0.03],
+                    "long_close_grid_markup_start": [0.001, 0.03],
                     "long_close_grid_qty_pct": [0.05, 1.0],
                     "long_close_trailing_grid_ratio": [-1.0, 1.0],
                     "long_close_trailing_qty_pct": [0.05, 1.0],
@@ -611,19 +616,21 @@ def get_template_live_config(passivbot_mode="v7"):
                     "long_entry_grid_spacing_weight": [0.0, 2.0],
                     "long_entry_initial_ema_dist": [-0.1, 0.002],
                     "long_entry_initial_qty_pct": [0.005, 0.1],
+                    "long_entry_trailing_double_down_factor": [0.1, 3.0],
                     "long_entry_trailing_grid_ratio": [-1.0, 1.0],
                     "long_entry_trailing_retracement_pct": [0.0, 0.1],
                     "long_entry_trailing_threshold_pct": [-0.1, 0.1],
-                    "long_filter_rolling_window": [10.0, 1440.0],
-                    "long_filter_relative_volume_clip_pct": [0.0, 1.0],
+                    "long_filter_noisiness_rolling_window": [10.0, 1440.0],
+                    "long_filter_volume_drop_pct": [0.0, 1.0],
+                    "long_filter_volume_rolling_window": [10.0, 1440.0],
                     "long_n_positions": [1.0, 20.0],
                     "long_total_wallet_exposure_limit": [0.0, 2.0],
                     "long_unstuck_close_pct": [0.001, 0.1],
                     "long_unstuck_ema_dist": [-0.1, 0.01],
                     "long_unstuck_loss_allowance_pct": [0.001, 0.05],
                     "long_unstuck_threshold": [0.4, 0.95],
-                    "short_close_grid_markup_range": [0.0, 0.03],
-                    "short_close_grid_min_markup": [0.001, 0.03],
+                    "short_close_grid_markup_end": [0.001, 0.03],
+                    "short_close_grid_markup_start": [0.001, 0.03],
                     "short_close_grid_qty_pct": [0.05, 1.0],
                     "short_close_trailing_grid_ratio": [-1.0, 1.0],
                     "short_close_trailing_qty_pct": [0.05, 1.0],
@@ -636,11 +643,13 @@ def get_template_live_config(passivbot_mode="v7"):
                     "short_entry_grid_spacing_weight": [0.0, 2.0],
                     "short_entry_initial_ema_dist": [-0.1, 0.002],
                     "short_entry_initial_qty_pct": [0.005, 0.1],
+                    "short_entry_trailing_double_down_factor": [0.1, 3.0],
                     "short_entry_trailing_grid_ratio": [-1.0, 1.0],
                     "short_entry_trailing_retracement_pct": [0.0, 0.1],
                     "short_entry_trailing_threshold_pct": [-0.1, 0.1],
-                    "short_filter_rolling_window": [10.0, 1440.0],
-                    "short_filter_relative_volume_clip_pct": [0.0, 1.0],
+                    "short_filter_noisiness_rolling_window": [10.0, 1440.0],
+                    "short_filter_volume_drop_pct": [0.0, 1.0],
+                    "short_filter_volume_rolling_window": [10.0, 1440.0],
                     "short_n_positions": [1.0, 20.0],
                     "short_total_wallet_exposure_limit": [0.0, 2.0],
                     "short_unstuck_close_pct": [0.001, 0.1],
@@ -650,21 +659,15 @@ def get_template_live_config(passivbot_mode="v7"):
                 },
                 "compress_results_file": True,
                 "crossover_probability": 0.7,
+                "enable_overrides": [],
                 "iters": 30000,
-                "limits": {
-                    "lower_bound_drawdown_worst": 0.25,
-                    "lower_bound_drawdown_worst_mean_1pct": 0.15,
-                    "lower_bound_equity_balance_diff_neg_max": 0.35,
-                    "lower_bound_equity_balance_diff_neg_mean": 0.005,
-                    "lower_bound_equity_balance_diff_pos_max": 0.5,
-                    "lower_bound_equity_balance_diff_pos_mean": 0.01,
-                    "lower_bound_loss_profit_ratio": 0.6,
-                    "lower_bound_position_held_hours_max": 336.0,
-                },
-                "mutation_probability": 0.2,
+                "limits": "--drawdown_worst 0.333 --loss_profit_ratio: 0.9 --position_unchanged_hours_max 300.0",
+                "mutation_probability": 0.45,
                 "n_cpus": 5,
-                "population_size": 500,
+                "population_size": 1000,
+                "round_to_n_significant_digits": 5,
                 "scoring": ["adg", "sharpe_ratio"],
+                "write_all_results": True,
             },
         }
     elif passivbot_mode == "multi_hjson":
@@ -2086,7 +2089,7 @@ def stats_multi_to_df(stats, symbols, c_mults):
             d[f"{symbols[i]}_price"] = x[3][i]
 
             d[f"{symbols[i]}_upnl_pct_l"] = (
-                calc_pnl_long(
+                pbr.calc_pnl_long(
                     d[f"{symbols[i]}_pprice_l"],
                     d[f"{symbols[i]}_price"],
                     d[f"{symbols[i]}_psize_l"],
@@ -2096,7 +2099,7 @@ def stats_multi_to_df(stats, symbols, c_mults):
                 / d["balance"]
             )
             d[f"{symbols[i]}_upnl_pct_s"] = (
-                calc_pnl_short(
+                pbr.calc_pnl_short(
                     d[f"{symbols[i]}_pprice_s"],
                     d[f"{symbols[i]}_price"],
                     d[f"{symbols[i]}_psize_s"],
@@ -2121,8 +2124,8 @@ def calc_upnl(row, c_mults_d):
     if row.psize == 0.0:
         return 0.0
     if row.psize < 0.0:
-        return calc_pnl_short(row.pprice, row.price, row.psize, False, c_mults_d[row.symbol])
-    return calc_pnl_long(row.pprice, row.price, row.psize, False, c_mults_d[row.symbol])
+        return pbr.calc_pnl_short(row.pprice, row.price, row.psize, False, c_mults_d[row.symbol])
+    return pbr.calc_pnl_long(row.pprice, row.price, row.psize, False, c_mults_d[row.symbol])
 
 
 def fills_multi_to_df(fills, symbols, c_mults):
@@ -2403,6 +2406,14 @@ def determine_side_from_order_tuple(order_tuple):
             raise Exception(f"malformed order tuple {order_tuple}")
     else:
         raise Exception(f"malformed order tuple {order_tuple}")
+
+
+def coin_to_symbol(coin, eligible_symbols, quote):
+    coinf = symbol_to_coin(coin)
+    for candidate in eligible_symbols:
+        if coinf == symbol_to_coin(candidate):
+            return candidate
+    return None
 
 
 def symbol_to_coin(symbol: str) -> str:
