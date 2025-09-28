@@ -1,6 +1,11 @@
 from __future__ import annotations
 import os
 
+# fix Crashes on Windows
+from tools.event_loop_policy import set_windows_event_loop_policy
+
+set_windows_event_loop_policy()
+
 from ccxt.base.errors import NetworkError
 import random
 import traceback
@@ -23,6 +28,7 @@ from utils import (
     ts_to_date_utc,
     make_get_filepath,
     format_approved_ignored_coins,
+    filter_markets,
 )
 from prettytable import PrettyTable
 from uuid import uuid4
@@ -63,7 +69,7 @@ _TYPE_MARKER_RE = re.compile(r"0x([0-9a-fA-F]{4})", re.IGNORECASE)
 _LEADING_HEX4_RE = re.compile(r"^(?:0x)?([0-9a-fA-F]{4})", re.IGNORECASE)
 
 
-def custom_id_to_snake(self, custom_id) -> str:
+def custom_id_to_snake(custom_id) -> str:
     try:
         return snake_of(try_decode_type_id_from_custom_id(custom_id))
     except Exception as e:
@@ -290,28 +296,9 @@ class Passivbot:
         self.markets_dict = await load_markets(self.exchange, 0, verbose=False)
         await self.determine_utc_offset(verbose)
         # ineligible symbols cannot open new positions
-        self.ineligible_symbols = {}
-        self.eligible_symbols = set()
-        for symbol in sorted(self.markets_dict):
-            if not self.markets_dict[symbol]["active"]:
-                self.ineligible_symbols[symbol] = "not active"
-            elif not self.markets_dict[symbol]["swap"]:
-                self.ineligible_symbols[symbol] = "wrong market type"
-            elif not self.markets_dict[symbol]["linear"]:
-                self.ineligible_symbols[symbol] = "not linear"
-            elif not symbol.endswith(f"/{self.quote}:{self.quote}"):
-                self.ineligible_symbols[symbol] = "wrong quote"
-            elif not self.symbol_is_eligible(symbol):
-                self.ineligible_symbols[symbol] = f"not eligible on {self.exchange}"
-            else:
-                self.eligible_symbols.add(symbol)
-        if verbose:
-            for line in set(self.ineligible_symbols.values()):
-                syms_ = [s for s in self.ineligible_symbols if self.ineligible_symbols[s] == line]
-                if len(syms_) > 12:
-                    logging.info(f"{line}: {len(syms_)} symbols")
-                elif len(syms_) > 0:
-                    logging.info(f"{line}: {','.join(sorted(set([s for s in syms_])))}")
+        eligible, _, reasons = filter_markets(self.markets_dict, self.exchange, verbose)
+        self.eligible_symbols = set(eligible)
+        self.ineligible_symbols = reasons
         self.set_market_specific_settings()
         # for prettier printing
         self.max_len_symbol = max([len(s) for s in self.markets_dict])
@@ -1523,11 +1510,13 @@ class Passivbot:
                     if self.has_position(pside, symbol):
                         # if in panic mode, only one close order at current market price
                         qmul = -1 if pside == "long" else 1
+                        panic_order_type = f"close_panic_{pside}"
                         ideal_orders[symbol].append(
                             (
                                 abs(self.positions[symbol][pside]["size"]) * qmul,
                                 self.get_last_price(symbol),
-                                f"panic_close_{pside}",
+                                panic_order_type,
+                                pbr.order_type_snake_to_id(panic_order_type),
                             )
                         )
                 elif self.PB_modes[pside][symbol] in [
