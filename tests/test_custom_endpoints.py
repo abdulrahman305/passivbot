@@ -37,7 +37,9 @@ def test_load_custom_endpoint_config_parses_binance_override(tmp_path):
                 "binanceusdm": {
                     "disable_ws": True,
                     "rest": {
-                        "rewrite_domains": {"https://fapi.binance.com": "https://binance-fapi-1.mltech.ai"}
+                        "rewrite_domains": {
+                            "https://fapi.binance.com": "https://proxy.example.exchange"
+                        }
                     },
                 }
             },
@@ -50,7 +52,7 @@ def test_load_custom_endpoint_config_parses_binance_override(tmp_path):
     assert override is not None
     assert override.disable_ws is True
     assert override.rest_domain_rewrites == {
-        "https://fapi.binance.com": "https://binance-fapi-1.mltech.ai"
+        "https://fapi.binance.com": "https://proxy.example.exchange"
     }
     assert override.rest_url_overrides == {}
     assert override.rest_extra_headers == {}
@@ -85,6 +87,28 @@ def test_apply_rest_overrides_to_ccxt_updates_urls_and_headers():
     assert exchange.urls["api"]["public"] == "https://api.binance.com/api/v3"
     assert exchange.headers["existing"] == "header"
     assert exchange.headers["X-Test"] == "1"
+
+
+def test_apply_rest_overrides_handles_hostname_placeholder():
+    override = ResolvedEndpointOverride(
+        exchange_id="bybit",
+        rest_domain_rewrites={"https://api.{hostname}": "https://bybit-proxy"},
+        disable_ws=True,
+    )
+
+    class DummyBybit:
+        def __init__(self):
+            self.hostname = "bybit.com"
+            self.urls = {
+                "api": {"public": "https://api.{hostname}/v5", "private": "https://api.{hostname}/v5"}
+            }
+            self.headers = {}
+
+    exchange = DummyBybit()
+    apply_rest_overrides_to_ccxt(exchange, override)
+
+    assert exchange.urls["api"]["public"] == "https://bybit-proxy/v5"
+    assert exchange.urls["api"]["private"] == "https://bybit-proxy/v5"
 
 
 def test_configure_loader_disables_autodiscovery():
