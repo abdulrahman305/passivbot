@@ -20,6 +20,8 @@ import hmac
 import hashlib
 import base64
 
+calc_order_price_diff = pbr.calc_order_price_diff
+
 # ---------------------------------------------------------------------------
 # Broker mixin classes for injecting KC-BROKER-NAME on KuCoin futures requests.
 #
@@ -96,6 +98,8 @@ assert_correct_ccxt_version(ccxt=ccxt_async)
 
 
 class KucoinBot(Passivbot):
+    MAX_OPEN_ORDERS = 150
+
     def __init__(self, config: dict):
         super().__init__(config)
         self.custom_id_max_length = 40
@@ -151,6 +155,7 @@ class KucoinBot(Passivbot):
         )
 
         self.cca = async_cls(dict(base_kwargs))
+        self.cca.options.update(self._build_ccxt_options())
         try:
             self.cca.options["defaultType"] = "swap"
         except Exception:
@@ -159,6 +164,7 @@ class KucoinBot(Passivbot):
 
         if self.ws_enabled:
             self.ccp = pro_cls(dict(base_kwargs))
+            self.ccp.options.update(self._build_ccxt_options())
             try:
                 self.ccp.options["defaultType"] = "swap"
             except Exception:
@@ -259,6 +265,27 @@ class KucoinBot(Passivbot):
             print_async_exception(fetched_balance)
             traceback.print_exc()
             return False
+
+    async def calc_ideal_orders(self, allow_unstuck: bool = True):
+        # KuCoin enforces a 150 open-order cap; keep only the closest price targets.
+        ideal_orders = await super().calc_ideal_orders(allow_unstuck=allow_unstuck)
+        flattened = []
+        for symbol, orders in ideal_orders.items():
+            if not orders:
+                continue
+            market_price = await self.cm.get_current_close(symbol, max_age_ms=10_000)
+            for order in orders:
+                price_diff = calc_order_price_diff(order["side"], order["price"], market_price)
+                flattened.append((price_diff, symbol, order))
+        limit = getattr(self, "MAX_OPEN_ORDERS", 150)
+        flattened.sort(key=lambda x: x[0])
+        trimmed = flattened[:limit] if limit and limit > 0 else flattened
+        filtered: dict[str, list] = {symbol: [] for symbol in self.active_symbols}
+        for _, symbol, order in trimmed:
+            filtered.setdefault(symbol, []).append(order)
+        for symbol in ideal_orders:
+            filtered.setdefault(symbol, ideal_orders[symbol])
+        return filtered
 
     async def fetch_tickers(self):
         fetched = None
@@ -421,6 +448,31 @@ class KucoinBot(Passivbot):
                 deduped[t["id"]] = t
 
         return sorted(deduped.values(), key=lambda x: x["timestamp"])
+
+    async def gather_fill_events(self, start_time=None, end_time=None, limit=None):
+        """Return canonical fill events for Kucoin (draft placeholder)."""
+        events = []
+        try:
+            fills = await self.fetch_pnls(start_time=start_time, end_time=end_time, limit=limit)
+        except Exception as exc:
+            logging.error(f"error gathering fill events (kucoin) {exc}")
+            return events
+        for fill in fills:
+            events.append(
+                {
+                    "id": fill.get("id") or fill.get("orderId"),
+                    "timestamp": fill.get("timestamp"),
+                    "symbol": fill.get("symbol"),
+                    "side": fill.get("side"),
+                    "position_side": fill.get("position_side"),
+                    "qty": fill.get("qty") or fill.get("amount"),
+                    "price": fill.get("price"),
+                    "pnl": fill.get("pnl"),
+                    "fee": fill.get("fee"),
+                    "info": fill.get("info"),
+                }
+            )
+        return events
 
     def get_order_execution_params(self, order: dict) -> dict:
         # defined for each exchange
