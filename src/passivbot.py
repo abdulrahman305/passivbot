@@ -537,8 +537,7 @@ class Passivbot:
         self.refresh_approved_ignored_coins_lists()
         # self.set_live_configs()
         self.set_wallet_exposure_limits()
-        await self.update_positions()
-        await self.update_balance()
+        await self.update_positions_and_balance()
         await self.update_open_orders()
         await self.update_effective_min_cost()
         # Legacy: no 1m OHLCV REST maintenance; CandlestickManager handles caching
@@ -1030,10 +1029,9 @@ class Passivbot:
         """Refresh positions, open orders, realised PnL, and 1m candles."""
         if self.stop_signal_received:
             return False
-        positions_ok = await self.update_positions()
+        balance_ok, positions_ok = await self.update_positions_and_balance()
         if not positions_ok:
             return False
-        await self.update_balance()
         open_orders_ok, pnls_ok = await asyncio.gather(
             self.update_open_orders(),
             self.update_pnls(),
@@ -1951,22 +1949,22 @@ class Passivbot:
             self.execution_scheduled = True
         return
 
-    async def handle_balance_update(self, upd, source="WS"):
-        """Process websocket balance updates and trigger execution if equity changes."""
-        try:
-            upd[self.quote]["total"] = round_dynamic(upd[self.quote]["total"], 10)
-            equity = upd[self.quote]["total"] + (await self.calc_upnl_sum())
-            if self.balance != upd[self.quote]["total"]:
+    async def handle_balance_update(self, source="REST"):
+        if not hasattr(self, '_previous_balance'):
+            self._previous_balance = 0.0
+        if self.balance != self._previous_balance:
+            try:
+                equity = self.balance + (await self.calc_upnl_sum())
                 logging.info(
-                    f"balance changed: {self.balance} -> {upd[self.quote]['total']} equity: {equity:.4f} source: {source}"
+                    f"balance changed: {self._previous_balance} -> {self.balance} equity: {equity:.4f} source: {source}"
                 )
+            except Exception as e:
+                logging.error(f"error with handle_balance_update {e}")
+                traceback.print_exc()
+            finally:
+                self._previous_balance = self.balance
                 self.execution_scheduled = True
-            self.balance = max(upd[self.quote]["total"], 1e-12)
-        except Exception as e:
-            logging.error(f"error updating balance from websocket {upd} {e}")
-            traceback.print_exc()
-
-    # Legacy: handle_ohlcv_1m_update removed
+                
 
     async def calc_upnl_sum(self):
         """Compute unrealised PnL across fetched positions using latest prices."""
@@ -2908,7 +2906,7 @@ class Passivbot:
                 self.open_orders[elm["symbol"]].append(elm)
             if schedule_update_positions:
                 await asyncio.sleep(1.5)
-                await self.update_positions()
+                await self.update_positions_and_balance()
             return True
         except RateLimitExceeded:
             logging.warning("rate limit while fetching open orders; retrying next cycle")
@@ -3048,8 +3046,8 @@ class Passivbot:
         for line in table.get_string().splitlines():
             logging.info(line)
 
-    async def update_positions(self):
-        """Fetch positions, update balance (if returned), and reconcile local position state."""
+    async def _fetch_and_apply_positions(self):
+        """Fetch raw positions, apply them to local state and return snapshots."""
         if not hasattr(self, "positions"):
             self.positions = {}
         try:
@@ -3061,25 +3059,10 @@ class Passivbot:
             logging.error(f"network error fetching positions: {e}")
             return False
         if res is None or res is False:
-            return False
-        if isinstance(res, tuple):
-            positions_list_new, balance_new = res
-        else:
-            positions_list_new, balance_new = res, None
+            return False, None, None
+        positions_list_new = res
         fetched_positions_old = deepcopy(self.fetched_positions)
         self.fetched_positions = positions_list_new
-        if balance_new is not None:
-            try:
-                await self.handle_balance_update({self.quote: {"total": balance_new}}, source="REST")
-                self._last_balance_from_positions = balance_new
-                self._balance_from_positions_applied = True
-            except Exception as e:
-                logging.error(f"error handling balance from positions {e}")
-                traceback.print_exc()
-        try:
-            await self.log_position_changes(fetched_positions_old, self.fetched_positions)
-        except Exception as e:
-            logging.error(f"error logging position changes {e}")
         positions_new = {
             sym: {
                 "long": {"size": 0.0, "price": 0.0},
@@ -3097,34 +3080,30 @@ class Passivbot:
                 }
             positions_new[symbol][pside] = {"size": psize, "price": pprice}
         self.positions = positions_new
+        return True, fetched_positions_old, self.fetched_positions
+
+    async def update_positions(self, *, log_changes: bool = True):
+        """Fetch positions, update local caches, and optionally log any changes."""
+        ok, fetched_positions_old, fetched_positions_new = await self._fetch_and_apply_positions()
+        if not ok:
+            return False
+        if log_changes and fetched_positions_old is not None:
+            try:
+                await self.log_position_changes(fetched_positions_old, fetched_positions_new)
+            except Exception as e:
+                logging.error(f"error logging position changes {e}")
         return True
 
     async def update_balance(self):
-        """Fetch and apply balance. Uses cached balance from update_positions when available."""
+        """Fetch and apply the latest wallet balance."""
         try:
-            cached = getattr(self, "_last_balance_from_positions", None)
-            applied = getattr(self, "_balance_from_positions_applied", False)
-            if cached is not None:
-                # If it was already applied during update_positions, skip re-applying.
-                if applied:
-                    logging.debug(
-                        "update_balance: using cached balance from positions (already applied); skipping fetch"
-                    )
-                    self._last_balance_from_positions = None
-                    self._balance_from_positions_applied = False
-                    return True
-                await self.handle_balance_update({self.quote: {"total": cached}}, source="REST")
-                self._last_balance_from_positions = None
-                self._balance_from_positions_applied = False
-                return True
-
             if not hasattr(self, "fetch_balance"):
                 logging.debug("update_balance: no fetch_balance implemented")
                 return False
             balance = await self.fetch_balance()
             if balance is None:
                 return False
-            await self.handle_balance_update({self.quote: {"total": balance}}, source="REST")
+            self.balance = balance
             return True
         except RateLimitExceeded:
             logging.warning("rate limit while fetching balance; retrying next cycle")
@@ -3139,6 +3118,20 @@ class Passivbot:
             logging.error(f"error updating balance {e}")
             traceback.print_exc()
             return False
+
+    async def update_positions_and_balance(self):
+        """Convenience helper to refresh both positions and balance concurrently."""
+        balance_task = asyncio.create_task(self.update_balance())
+        positions_ok, fetched_positions_old, fetched_positions_new = await self._fetch_and_apply_positions()
+        balance_ok = await balance_task
+        if positions_ok and fetched_positions_old is not None:
+            try:
+                await self.log_position_changes(fetched_positions_old, fetched_positions_new)
+            except Exception as e:
+                logging.error(f"error logging position changes {e}")
+        if balance_ok and positions_ok:
+            await self.handle_balance_update(source="REST")
+        return balance_ok, positions_ok
 
     async def update_effective_min_cost(self, symbol=None):
         """Update the effective minimum order cost for one or all symbols."""
