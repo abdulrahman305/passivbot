@@ -6,7 +6,9 @@ from rust_utils import check_and_maybe_compile
 # Perform Rust compilation check before importing any modules that may load the extension
 _rust_parser = argparse.ArgumentParser(add_help=False)
 _rust_parser.add_argument("--skip-rust-compile", action="store_true", help="Skip Rust build check.")
-_rust_parser.add_argument("--force-rust-compile", action="store_true", help="Force rebuild of Rust extension.")
+_rust_parser.add_argument(
+    "--force-rust-compile", action="store_true", help="Force rebuild of Rust extension."
+)
 _rust_parser.add_argument(
     "--fail-on-stale-rust",
     action="store_true",
@@ -82,6 +84,13 @@ from logging_setup import configure_logging, resolve_log_level
 from suite_runner import extract_suite_config, run_backtest_suite_async
 import passivbot_rust as pbr  # noqa: E402
 from tools.event_loop_policy import set_windows_event_loop_policy
+
+# Fallback stubs for test environments without full extension symbols
+if not hasattr(pbr, "HlcvsBundle"):  # pragma: no cover
+    class HlcvsBundle:
+        pass
+
+    pbr.HlcvsBundle = HlcvsBundle  # type: ignore
 
 # on Windows this will pick the SelectorEventLoopPolicy
 set_windows_event_loop_policy()

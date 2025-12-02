@@ -28,7 +28,9 @@ from rust_utils import check_and_maybe_compile
 
 _rust_parser = argparse.ArgumentParser(add_help=False)
 _rust_parser.add_argument("--skip-rust-compile", action="store_true", help="Skip Rust build check.")
-_rust_parser.add_argument("--force-rust-compile", action="store_true", help="Force rebuild of Rust extension.")
+_rust_parser.add_argument(
+    "--force-rust-compile", action="store_true", help="Force rebuild of Rust extension."
+)
 _rust_parser.add_argument(
     "--fail-on-stale-rust",
     action="store_true",
@@ -88,7 +90,31 @@ import logging
 import traceback
 import json
 import pprint
-from deap import base, creator, tools, algorithms
+try:
+    from deap import base, creator, tools, algorithms
+except ImportError:  # pragma: no cover - allow import in minimal test envs
+    class _DummyFitness:
+        weights = ()
+
+        def __init__(self, values=()):
+            self.values = values
+
+        def wvalues(self):
+            return self.values
+
+    class _DummyBase:
+        Fitness = _DummyFitness
+
+    class _DummyCreator:
+        def create(self, *args, **kwargs):
+            return None
+
+        def __getattr__(self, name):
+            raise AttributeError
+
+    base = _DummyBase()
+    creator = _DummyCreator()
+    tools = algorithms = None
 import math
 import fcntl
 from optimizer_overrides import optimizer_overrides
@@ -712,6 +738,7 @@ class Evaluator:
 
         shared_metric_weights = {
             "positions_held_per_day": 1.0,
+            "positions_held_per_day_w": 1.0,
             "position_held_hours_mean": 1.0,
             "position_held_hours_max": 1.0,
             "position_held_hours_median": 1.0,
@@ -1176,10 +1203,16 @@ class SuiteEvaluator:
             logging.debug(
                 "Scenario metrics | label=%s adg_pnl=%s peak_recovery_hours_pnl=%s",
                 ctx.label,
-                stats.get("adg_pnl", {}).get("mean") if isinstance(stats.get("adg_pnl"), dict) else stats.get("adg_pnl"),
-                stats.get("peak_recovery_hours_pnl", {}).get("mean")
-                if isinstance(stats.get("peak_recovery_hours_pnl"), dict)
-                else stats.get("peak_recovery_hours_pnl"),
+                (
+                    stats.get("adg_pnl", {}).get("mean")
+                    if isinstance(stats.get("adg_pnl"), dict)
+                    else stats.get("adg_pnl")
+                ),
+                (
+                    stats.get("peak_recovery_hours_pnl", {}).get("mean")
+                    if isinstance(stats.get("peak_recovery_hours_pnl"), dict)
+                    else stats.get("peak_recovery_hours_pnl")
+                ),
             )
             scenario_results.append(
                 ScenarioResult(
